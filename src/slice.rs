@@ -30,6 +30,7 @@ pub struct AppState {
     pub config: Config,
     pub contract: Arc<Contract>,
     pub profiles: Arc<Value>,
+    pub profile_catalog: Arc<crate::profiles::ProfileCatalog>,
     pub progress: ProgressStore,
     pub slots: Arc<Semaphore>,
 }
@@ -137,7 +138,7 @@ async fn slice_job(
             }
             "printerProfile" | "presetProfile" => {
                 let expected = if name == "printerProfile" { "machine" } else { "process" };
-                let bytes = profile_bytes(field, expected).await?;
+                let bytes = profile_bytes(field, expected, &s.profile_catalog).await?;
                 let path = dir.join(&name);
                 tokio::fs::write(&path, bytes).await?;
                 if name == "printerProfile" {
@@ -150,7 +151,7 @@ async fn slice_job(
                 if filaments.len() == 16 {
                     return Err(AppError::Bad("maximum 16 filament profiles".into()));
                 }
-                let bytes = profile_bytes(field, "filament").await?;
+                let bytes = profile_bytes(field, "filament", &s.profile_catalog).await?;
                 let path = dir.join(format!("filament_{}", filaments.len()));
                 tokio::fs::write(&path, bytes).await?;
                 filaments.push(path);
@@ -528,6 +529,7 @@ fn progress_from_json(value: &Value, default_plate: Option<u32>) -> Progress {
 async fn profile_bytes(
     field: axum::extract::multipart::Field<'_>,
     expected: &str,
+    catalog: &crate::profiles::ProfileCatalog,
 ) -> Result<Vec<u8>, AppError> {
     let bytes = field_bytes(field, MAX_PROFILE).await.map_err(AppError::Bad)?;
     let value: Value = serde_json::from_slice(&bytes)
@@ -539,6 +541,26 @@ async fn profile_bytes(
         || object.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
         || object.get("setting_id").and_then(Value::as_str).is_none_or(str::is_empty)
     {
+        if object.len() == 4
+            && object.get("type").and_then(Value::as_str) == Some(expected)
+            && object.get("name").and_then(Value::as_str).is_some_and(|x| !x.is_empty())
+            && object.get("inherits").and_then(Value::as_str).is_some_and(|x| !x.is_empty())
+            && object.get("from").and_then(Value::as_str) == Some("system")
+            && !object.contains_key("setting_id")
+            && object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "name" | "inherits" | "from"))
+        {
+            let name = object["name"].as_str().unwrap();
+            let inherits = object["inherits"].as_str().unwrap();
+            if name != inherits {
+                return Err(AppError::Bad("bundled profile name must match inherits".into()));
+            }
+            return catalog
+                .get(&(expected.into(), inherits.into()))
+                .cloned()
+                .ok_or_else(|| AppError::Bad(format!("unknown bundled {expected} profile")));
+        }
         return Err(AppError::Bad(format!(
             "{expected} profile requires type, name, and setting_id"
         )));

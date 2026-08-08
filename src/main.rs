@@ -10,11 +10,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut contract =
         parse_contract(&std::fs::read(&config.schema_path)?).map_err(std::io::Error::other)?;
     contract.image_identity.digest.clone_from(&config.image_digest);
-    let bundled_profiles = if let Some(path) = &config.profiles_path {
-        profiles::load_profile_index(path).map_err(std::io::Error::other)?
-    } else {
-        serde_json::json!({"printer": [], "process": [], "filament": []})
-    };
+    let (bundled_profiles, profile_catalog) =
+        match (config.profiles_path.as_ref(), config.profile_source_path.as_ref()) {
+            (Some(index_path), Some(source_path)) => (
+                profiles::load_profile_index(index_path).map_err(std::io::Error::other)?,
+                profiles::load_profile_catalog(source_path).map_err(std::io::Error::other)?,
+            ),
+            (None, None) => (
+                serde_json::json!({"printer": [], "process": [], "filament": []}),
+                Default::default(),
+            ),
+            _ => {
+                return Err(std::io::Error::other(
+                    "ORCA_PROFILES_PATH and ORCA_PROFILE_SOURCE_PATH must be configured together",
+                )
+                .into());
+            }
+        };
     tokio::fs::create_dir_all(&config.data_dir).await?;
     storage::reset_jobs(&config.data_dir).await?;
     for directory in ["tmp", "cache", "config"] {
@@ -25,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress: progress::ProgressStore::new(),
         contract: Arc::new(contract),
         profiles: Arc::new(bundled_profiles),
+        profile_catalog: Arc::new(profile_catalog),
         config,
     };
     let listener = TcpListener::bind("0.0.0.0:3000").await?;

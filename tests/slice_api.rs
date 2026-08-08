@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Cursor, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -83,10 +83,13 @@ fn fake_cli(root: &Path) -> PathBuf {
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\npwd > '{}'\ntouch \"$PWD/cwd-writable\" || exit 1\nprintf writable > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nexport_3mf=0\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--outputdir' ]; then shift; output=$1; fi\n  if [ \"$1\" = '--export-3mf' ]; then export_3mf=1; fi\n  shift\ndone\nif [ \"$export_3mf\" = 1 ]; then\n  cp '{}' \"$output/result.3mf\"\nelse\n  printf '; estimated printing time (normal mode) = 10m 56s\n; filament used [mm] = 302.50\n; total filament used [g] = 0.94\nfixture-gcode' > \"$output/result.gcode\"\nfi\n",
+            "#!/bin/sh\npwd > '{}'\ntouch \"$PWD/cwd-writable\" || exit 1\nprintf writable > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nexport_3mf=0\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--outputdir' ]; then shift; output=$1; fi\n  if [ \"$1\" = '--export-3mf' ]; then export_3mf=1; fi\n  if [ \"$1\" = '--load-settings' ]; then\n    shift\n    printer=${{1%%;*}}\n    process=${{1#*;}}\n    cp \"$printer\" '{}'\n    cp \"$process\" '{}'\n  fi\n  if [ \"$1\" = '--load-filaments' ]; then\n    shift\n    filament=${{1%%;*}}\n    cp \"$filament\" '{}'\n  fi\n  shift\ndone\nif [ \"$export_3mf\" = 1 ]; then\n  cp '{}' \"$output/result.3mf\"\nelse\n  printf '; estimated printing time (normal mode) = 10m 56s\n; filament used [mm] = 302.50\n; total filament used [g] = 0.94\nfixture-gcode' > \"$output/result.gcode\"\nfi\n",
             cwd_path.display(),
             cwd_writable_path.display(),
             args_path.display(),
+            root.join("captured-printer.json").display(),
+            root.join("captured-process.json").display(),
+            root.join("captured-filament.json").display(),
             archive_path.display()
         ),
     )
@@ -131,10 +134,12 @@ fn state(root: &Path) -> AppState {
             image_digest: contract.image_identity.digest.clone(),
             schema_path: PathBuf::from("unused"),
             profiles_path: None,
+            profile_source_path: None,
             max_concurrency: 1,
         },
         contract: Arc::new(contract),
         profiles: Arc::new(json!({"printer":[],"process":[],"filament":[]})),
+        profile_catalog: Arc::new(Default::default()),
         progress: ProgressStore::new(),
         slots: Arc::new(tokio::sync::Semaphore::new(1)),
     }
@@ -159,6 +164,93 @@ fn multipart(parts: &[(&str, Option<&str>, &str)]) -> (String, Vec<u8>) {
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+#[tokio::test]
+async fn slice_materializes_trusted_profile_stubs_and_rejects_unknown_names() {
+    let root = test_dir("profile-stubs");
+    let profile_root = root.join("profiles");
+    for category in ["machine", "process", "filament"] {
+        fs::create_dir_all(profile_root.join(category)).unwrap();
+    }
+    let machine = br#"{"type":"machine","name":"Machine Official","setting_id":"machine"}"#;
+    let process =
+        br#"{"type":"process","name":"Process Official","setting_id":"process","inherits":"Base"}"#;
+    let filament = br#"{"type":"filament","name":"Filament Official","setting_id":"filament"}"#;
+    fs::write(profile_root.join("machine/official.json"), machine).unwrap();
+    fs::write(profile_root.join("process/official.json"), process).unwrap();
+    fs::write(profile_root.join("filament/official.json"), filament).unwrap();
+    fs::write(profile_root.join("metadata.json"), br#"{"version":1}"#).unwrap();
+    fs::write(
+        profile_root.join("process/abstract.json"),
+        br#"{"type":"process","instantiation":"false"}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(&profile_root).unwrap();
+    assert_eq!(catalog.len(), 3);
+    let mut app_state = state(&root);
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    let machine_stub = r#"{"type":"machine","name":"Machine Official","inherits":"Machine Official","from":"system"}"#;
+    let process_stub = r#"{"type":"process","name":"Process Official","inherits":"Process Official","from":"system"}"#;
+    let filament_stub = r#"{"type":"filament","name":"Filament Official","inherits":"Filament Official","from":"system"}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), machine_stub),
+        ("presetProfile", Some("preset.json"), process_stub),
+        ("filamentProfile", Some("filament.json"), filament_stub),
+    ]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fs::read(root.join("captured-printer.json")).unwrap(), machine);
+    assert_eq!(fs::read(root.join("captured-process.json")).unwrap(), process);
+    assert_eq!(fs::read(root.join("captured-filament.json")).unwrap(), filament);
+
+    let unknown_stub =
+        r#"{"type":"process","name":"../escape","inherits":"../escape","from":"system"}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), machine_stub),
+        ("presetProfile", Some("preset.json"), unknown_stub),
+        ("filamentProfile", Some("filament.json"), filament_stub),
+    ]);
+    let response = app
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["details"], "unknown bundled process profile");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn profile_catalog_rejects_symlinks() {
+    let root = test_dir("profile-symlink");
+    let outside = root.join("outside.json");
+    let profile_root = root.join("profiles");
+    fs::create_dir(&profile_root).unwrap();
+    fs::write(&outside, br#"{"type":"process","name":"Outside","setting_id":"outside"}"#).unwrap();
+    symlink(&outside, profile_root.join("linked.json")).unwrap();
+    let error = orca_slicer_api::profiles::load_profile_catalog(&profile_root).unwrap_err();
+    assert!(error.contains("profile source contains symlink"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -247,6 +339,11 @@ async fn slice_rejects_invalid_profile_shapes_before_running_orca() {
             "printerProfile",
             r#"{"type":"process","name":"Printer","setting_id":"printer"}"#,
             "machine profile requires type, name, and setting_id",
+        ),
+        (
+            "presetProfile",
+            r#"{"type":"process","name":"Claimed","inherits":"Actual","from":"system"}"#,
+            "bundled profile name must match inherits",
         ),
         (
             "filamentProfile",
