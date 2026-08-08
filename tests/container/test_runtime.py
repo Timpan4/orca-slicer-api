@@ -22,20 +22,20 @@ CUBE = os.path.join(os.path.dirname(__file__), "../../fixtures/container/cube.st
 PROFILE_STUBS = {
     "printer.json": {
         "type": "machine",
-        "name": "Creality Ender-3 V4 0.4 nozzle",
-        "inherits": "Creality Ender-3 V4 0.4 nozzle",
+        "name": "Bambu Lab X1 Carbon 0.4 nozzle",
+        "inherits": "Bambu Lab X1 Carbon 0.4 nozzle",
         "from": "system",
     },
     "process.json": {
         "type": "process",
-        "name": "0.20mm Standard @Creality Ender-3 V4 0.4 nozzle",
-        "inherits": "0.20mm Standard @Creality Ender-3 V4 0.4 nozzle",
+        "name": "0.20mm Standard @BBL X1C",
+        "inherits": "0.20mm Standard @BBL X1C",
         "from": "system",
     },
     "filament.json": {
         "type": "filament",
-        "name": "CR-PLA @Ender-3 V4-all",
-        "inherits": "CR-PLA @Ender-3 V4-all",
+        "name": "Bambu PLA Basic @BBL X1C",
+        "inherits": "Bambu PLA Basic @BBL X1C",
         "from": "system",
     },
 }
@@ -173,7 +173,7 @@ try:
         assert headers["content-type"].split(";", 1)[0] == "application/octet-stream"
         assert float(headers["x-print-time-seconds"]) > 0
         assert float(headers["x-filament-used-mm"]) > 0
-        assert float(headers["x-filament-used-g"]) >= 0
+        assert float(headers["x-filament-used-g"]) > 0
         artifact = open(ARTIFACT, "rb").read()
         assert b"G0 " in artifact or b"G1 " in artifact
         assert b"fixture-gcode" not in artifact

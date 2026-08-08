@@ -174,8 +174,7 @@ async fn slice_materializes_trusted_profile_stubs_and_rejects_unknown_names() {
         fs::create_dir_all(profile_root.join(category)).unwrap();
     }
     let machine = br#"{"type":"machine","name":"Machine Official","setting_id":"machine"}"#;
-    let process =
-        br#"{"type":"process","name":"Process Official","setting_id":"process","inherits":"Base"}"#;
+    let process = br#"{"type":"process","name":"Process Official","setting_id":"process"}"#;
     let filament = br#"{"type":"filament","name":"Filament Official","setting_id":"filament"}"#;
     fs::write(profile_root.join("machine/official.json"), machine).unwrap();
     fs::write(profile_root.join("process/official.json"), process).unwrap();
@@ -237,6 +236,191 @@ async fn slice_materializes_trusted_profile_stubs_and_rejects_unknown_names() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["details"], "unknown bundled process profile");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_materializes_trusted_profile_inheritance() {
+    let root = test_dir("profile-inheritance");
+    let vendor_root = root.join("profiles/BBL");
+    let profile_root = vendor_root.join("filament");
+    for category in ["machine", "process", "filament"] {
+        fs::create_dir_all(vendor_root.join(category)).unwrap();
+    }
+    fs::write(
+        vendor_root.join("machine/printer.json"),
+        br#"{"type":"machine","name":"Bambu Lab X1 Carbon 0.4 nozzle","setting_id":"GM001"}"#,
+    )
+    .unwrap();
+    fs::write(
+        vendor_root.join("process/process.json"),
+        br#"{"type":"process","name":"0.20mm Standard @BBL X1C","setting_id":"GP004"}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile_root.join("fdm_filament_pla.json"),
+        br#"{"type":"filament","name":"fdm_filament_pla","instantiation":"false","filament_diameter":["1.75"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile_root.join("Bambu PLA Basic @base.json"),
+        br#"{"type":"filament","name":"Bambu PLA Basic @base","inherits":"fdm_filament_pla","instantiation":"false","filament_density":["1.26"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile_root.join("Bambu PLA Basic @BBL X1C.json"),
+        br#"{"type":"filament","name":"Bambu PLA Basic @BBL X1C","inherits":"Bambu PLA Basic @base","setting_id":"GFSA00","compatible_printers":["Bambu Lab X1 Carbon 0.4 nozzle"]}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(root.join("profiles")).unwrap();
+    assert_eq!(catalog.len(), 3);
+    let mut app_state = state(&root);
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    let machine_stub = r#"{"type":"machine","name":"Bambu Lab X1 Carbon 0.4 nozzle","inherits":"Bambu Lab X1 Carbon 0.4 nozzle","from":"system"}"#;
+    let process_stub = r#"{"type":"process","name":"0.20mm Standard @BBL X1C","inherits":"0.20mm Standard @BBL X1C","from":"system"}"#;
+    let filament_stub = r#"{"type":"filament","name":"Bambu PLA Basic @BBL X1C","inherits":"Bambu PLA Basic @BBL X1C","from":"system"}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), machine_stub),
+        ("presetProfile", Some("process.json"), process_stub),
+        ("filamentProfile", Some("filament.json"), filament_stub),
+    ]);
+    let response = app
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let materialized: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-filament.json")).unwrap()).unwrap();
+    assert_eq!(materialized["name"], "Bambu PLA Basic @BBL X1C");
+    assert_eq!(materialized["setting_id"], "GFSA00");
+    assert_eq!(materialized["filament_density"], json!(["1.26"]));
+    assert_eq!(materialized["filament_diameter"], json!(["1.75"]));
+    assert_eq!(materialized["compatible_printers"], json!(["Bambu Lab X1 Carbon 0.4 nozzle"]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn profile_catalog_fails_closed_for_invalid_inheritance() {
+    let root = test_dir("profile-inheritance-errors");
+    for directory in ["VendorA/process", "VendorB/process", "VendorC/process"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(
+        root.join("VendorA/process/missing.json"),
+        br#"{"type":"process","name":"Missing Child","inherits":"Missing Parent","setting_id":"missing"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("VendorA/process/cycle-child.json"),
+        br#"{"type":"process","name":"Cycle Child","inherits":"Cycle Base","setting_id":"cycle"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("VendorA/process/cycle-base.json"),
+        br#"{"type":"process","name":"Cycle Base","inherits":"Cycle Child","instantiation":"false"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("VendorA/process/ambiguous.json"),
+        br#"{"type":"process","name":"Ambiguous Child","inherits":"Shared Parent","setting_id":"ambiguous"}"#,
+    )
+    .unwrap();
+    for vendor in ["VendorB", "VendorC"] {
+        fs::write(
+            root.join(format!("{vendor}/process/shared.json")),
+            br#"{"type":"process","name":"Shared Parent","instantiation":"false"}"#,
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("VendorA/process/global.json"),
+        br#"{"type":"process","name":"Global Child","inherits":"Unique Parent","setting_id":"global"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("VendorB/process/unique.json"),
+        br#"{"type":"process","name":"Unique Parent","instantiation":"false","layer_height":["0.2"]}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(&root).unwrap();
+    assert_eq!(catalog.len(), 4);
+    assert!(
+        catalog
+            .resolve("process", "Missing Child")
+            .unwrap_err()
+            .contains("missing bundled process parent profile")
+    );
+    assert!(catalog.resolve("process", "Cycle Child").unwrap_err().contains("inheritance cycle"));
+    assert!(
+        catalog
+            .resolve("process", "Ambiguous Child")
+            .unwrap_err()
+            .contains("ambiguous bundled process parent profile")
+    );
+    let global: serde_json::Value =
+        serde_json::from_slice(&catalog.resolve("process", "Global Child").unwrap().unwrap())
+            .unwrap();
+    assert_eq!(global["name"], "Global Child");
+    assert_eq!(global["layer_height"], json!(["0.2"]));
+    assert!(catalog.resolve("process", "Unique Parent").unwrap().is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn profile_catalog_rejects_same_vendor_ambiguous_inheritance() {
+    let root = test_dir("profile-inheritance-scoped-ambiguity");
+    fs::create_dir_all(root.join("Vendor/process/nested")).unwrap();
+    fs::write(
+        root.join("Vendor/process/child.json"),
+        br#"{"type":"process","name":"Child","inherits":"Parent","setting_id":"child"}"#,
+    )
+    .unwrap();
+    for path in ["Vendor/process/parent.json", "Vendor/process/nested/parent.json"] {
+        fs::write(
+            root.join(path),
+            br#"{"type":"process","name":"Parent","instantiation":"false"}"#,
+        )
+        .unwrap();
+    }
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(&root).unwrap();
+    assert!(
+        catalog
+            .resolve("process", "Child")
+            .unwrap_err()
+            .contains("ambiguous bundled process parent profile")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn profile_catalog_defers_malformed_inheritance_until_resolution() {
+    let root = test_dir("profile-inheritance-malformed");
+    fs::create_dir_all(root.join("Vendor/process")).unwrap();
+    fs::write(
+        root.join("Vendor/process/valid.json"),
+        br#"{"type":"process","name":"Valid","setting_id":"valid"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("Vendor/process/malformed.json"),
+        br#"{"type":"process","name":"Malformed","inherits":[],"setting_id":"malformed"}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(&root).unwrap();
+    assert!(catalog.resolve("process", "Valid").unwrap().is_some());
+    assert!(catalog.resolve("process", "Malformed").unwrap_err().contains("invalid inherits"));
     fs::remove_dir_all(root).unwrap();
 }
 
