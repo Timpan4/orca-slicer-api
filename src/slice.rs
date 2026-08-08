@@ -557,8 +557,8 @@ async fn profile_bytes(
                 return Err(AppError::Bad("bundled profile name must match inherits".into()));
             }
             return catalog
-                .get(&(expected.into(), inherits.into()))
-                .cloned()
+                .resolve(expected, inherits)
+                .map_err(AppError::Bad)?
                 .ok_or_else(|| AppError::Bad(format!("unknown bundled {expected} profile")));
         }
         return Err(AppError::Bad(format!(

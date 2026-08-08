@@ -16,7 +16,7 @@ Service listens on port `3000`.
 - `POST /slice`
 - `GET /slice/progress/{request_id}`
 
-`POST /slice` accepts LayerCove multipart fields: `file`, `printerProfile`, `presetProfile`, repeated `filamentProfile`, `plate`, `exportType`, `arrange`, `schemaHash`, and `requestId`. Profile parts may contain complete profile JSON or an exact four-field system stub (`type`, `name`, `inherits`, `from`) whose `inherits` name resolves through the image's trusted bundled-profile catalog. Unknown or non-system stubs are rejected without treating request data as a filesystem path. `modelState` is unsupported: `model_state` remains false, and advanced per-object preparation is not available.
+`POST /slice` accepts LayerCove multipart fields: `file`, `printerProfile`, `presetProfile`, repeated `filamentProfile`, `plate`, `exportType`, `arrange`, `schemaHash`, and `requestId`. Profile parts may contain complete profile JSON or an exact four-field system stub (`type`, `name`, `inherits`, `from`) whose `inherits` name resolves through the image's trusted bundled-profile catalog. Stub profiles materialize their trusted official ancestor chain before slicing; missing, ambiguous, cyclic, unknown, or non-system profiles are rejected without treating request data as a filesystem path. `modelState` is unsupported: `model_state` remains false, and advanced per-object preparation is not available.
 
 Each slice gets a private Orca `--pipe` FIFO under `/app/data/jobs`. JSON events update the latest progress snapshot while Orca runs. Processes run in private process groups that are killed on timeout or service/request shutdown.
 
