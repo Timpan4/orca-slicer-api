@@ -61,10 +61,12 @@ fn state() -> AppState {
             image_digest: contract.image_identity.digest.clone(),
             schema_path: PathBuf::from("unused"),
             profiles_path: None,
+            profile_source_path: None,
             max_concurrency: 1,
         },
         contract: Arc::new(contract),
         profiles: Arc::new(json!({"printer":[],"process":[],"filament":[]})),
+        profile_catalog: Arc::new(Default::default()),
         progress: ProgressStore::new(),
         slots: Arc::new(tokio::sync::Semaphore::new(1)),
     }

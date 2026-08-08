@@ -8,6 +8,7 @@ pub struct Config {
     pub image_digest: String,
     pub schema_path: PathBuf,
     pub profiles_path: Option<PathBuf>,
+    pub profile_source_path: Option<PathBuf>,
     pub max_concurrency: usize,
 }
 impl Config {
@@ -40,6 +41,7 @@ impl Config {
             image_digest,
             schema_path,
             profiles_path: env::var("ORCA_PROFILES_PATH").ok().map(PathBuf::from),
+            profile_source_path: env::var("ORCA_PROFILE_SOURCE_PATH").ok().map(PathBuf::from),
             max_concurrency,
         })
     }

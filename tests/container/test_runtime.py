@@ -14,16 +14,30 @@ ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
 IMAGE = sys.argv[1] if len(sys.argv) == 2 else (_ for _ in ()).throw(SystemExit("usage: test_runtime.py IMAGE"))
 SUFFIX = f"{os.getpid()}"
 RUNTIME = f"orca-api-runtime-{SUFFIX}"
-HELPER = f"orca-api-profile-helper-{SUFFIX}"
 VOLUME = f"orca-api-data-{SUFFIX}"
 DIGEST = "sha256:" + "1" * 64
 ROOT = os.path.join(tempfile.gettempdir(), f"orca-api-runtime-{SUFFIX}")
 HEADERS, ARTIFACT = ROOT + ".headers", ROOT + ".gcode"
 CUBE = os.path.join(os.path.dirname(__file__), "../../fixtures/container/cube.stl")
-PROFILE_PATHS = {
-    "printer.json": "Creality/machine/Creality Ender-3 V4 0.4 nozzle.json",
-    "process.json": "Creality/process/0.20mm Standard @Creality Ender-3 V4 0.4 nozzle.json",
-    "filament.json": "Creality/filament/CR-PLA @Ender-3 V4-all.json",
+PROFILE_STUBS = {
+    "printer.json": {
+        "type": "machine",
+        "name": "Creality Ender-3 V4 0.4 nozzle",
+        "inherits": "Creality Ender-3 V4 0.4 nozzle",
+        "from": "system",
+    },
+    "process.json": {
+        "type": "process",
+        "name": "0.20mm Standard @Creality Ender-3 V4 0.4 nozzle",
+        "inherits": "0.20mm Standard @Creality Ender-3 V4 0.4 nozzle",
+        "from": "system",
+    },
+    "filament.json": {
+        "type": "filament",
+        "name": "CR-PLA @Ender-3 V4-all",
+        "inherits": "CR-PLA @Ender-3 V4-all",
+        "from": "system",
+    },
 }
 
 
@@ -34,8 +48,11 @@ def run(*args, capture=False, check=True):
 
 
 def cleanup():
-    for command, name in (("rm", RUNTIME), ("rm", HELPER)):
-        subprocess.run([ENGINE, command, "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        [ENGINE, "rm", "--force", RUNTIME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     subprocess.run([ENGINE, "volume", "rm", "--force", VOLUME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for path in (HEADERS, ARTIFACT):
         try:
@@ -71,11 +88,10 @@ def schema_hash(schema):
 cleanup()
 try:
     run("volume", "create", VOLUME, capture=True)
-    run("create", "--name", HELPER, "--entrypoint", "/bin/true", IMAGE, capture=True)
-    run("start", HELPER, capture=True)
     with tempfile.TemporaryDirectory(prefix="orca-api-profiles-") as profiles:
-        for name, source in PROFILE_PATHS.items():
-            run("cp", f"{HELPER}:/app/orca/resources/profiles/{source}", os.path.join(profiles, name), capture=True)
+        for name, stub in PROFILE_STUBS.items():
+            with open(os.path.join(profiles, name), "w", encoding="utf-8") as stream:
+                json.dump(stub, stream, separators=(",", ":"))
         run("run", "--detach", "--name", RUNTIME, "--read-only", "--user", "10001:10001",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--volume", f"{VOLUME}:/app/data",
             "--publish", "127.0.0.1::3000", "--env", f"ORCA_IMAGE_DIGEST={DIGEST}", IMAGE, capture=True)
@@ -89,6 +105,7 @@ try:
         assert [mount["Destination"] for mount in inspection["Mounts"]] == ["/app/data"]
         assert inspection["HostConfig"].get("Tmpfs", {}) == {}
         assert not any(value.startswith("ORCA_BRIDGE_PATH=") for value in inspection["Config"]["Env"])
+        assert "ORCA_PROFILE_SOURCE_PATH=/app/orca/resources/profiles" in inspection["Config"]["Env"]
         endpoint = run("port", RUNTIME, "3000/tcp", capture=True).stdout.strip()
         base = f"http://{endpoint}"
         while True:

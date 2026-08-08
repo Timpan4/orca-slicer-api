@@ -73,6 +73,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ORCA_CLI_PATH=/app/orca/AppRun \
     ORCA_SCHEMA_PATH=/app/schema/process.json \
     ORCA_PROFILES_PATH=/app/schema/profiles.json \
+    ORCA_PROFILE_SOURCE_PATH=/app/orca/resources/profiles \
     ORCA_DATA_DIR=/app/data \
     TMPDIR=/app/data/tmp \
     XDG_CACHE_HOME=/app/data/cache \

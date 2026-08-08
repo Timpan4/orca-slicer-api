@@ -27,6 +27,7 @@ test "$(grep -nF 'cargo test --locked --release --test pinned_source -- --ignore
   "$(grep -nF 'FROM ubuntu:24.04 AS runtime' "$dockerfile" | cut -d: -f1)"
 test "$(grep -Fc './target/release/schema-export' "$dockerfile")" -eq 2
 grep -Fq 'cmp /tmp/process-schema-first.json /tmp/process-schema-second.json' "$dockerfile"
+grep -Fq 'ORCA_PROFILE_SOURCE_PATH=/app/orca/resources/profiles' "$dockerfile"
 
 if awk '/^FROM ubuntu:24.04 AS runtime$/{runtime=1} runtime' "$dockerfile" | grep -Fq 'ORCA_BRIDGE_PATH'; then
   echo 'ORCA_BRIDGE_PATH is forbidden in runtime image' >&2
