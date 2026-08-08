@@ -49,47 +49,7 @@ ci_contract_line=$(grep -nF '      - run: tests/container/test_contract.sh' "$ci
 test -n "$ci_source_line"
 test -n "$ci_contract_line"
 test "$ci_source_line" -lt "$ci_contract_line"
-grep -Fqx '  gate:' "$publish_workflow"
-grep -Fqx '    permissions:' "$publish_workflow"
-grep -Fqx '      contents: read' "$publish_workflow"
-grep -Fqx '          persist-credentials: false' "$publish_workflow"
-grep -Fqx '    needs: gate' "$publish_workflow"
-grep -Fqx '      packages: write' "$publish_workflow"
-grep -Fqx '      id-token: write' "$publish_workflow"
-grep -Fqx '      attestations: write' "$publish_workflow"
-if awk '/^permissions:/{scope=1} /^jobs:/{scope=0} scope' "$publish_workflow" | grep -q 'write'; then
-  echo 'write permissions must not be global' >&2
-  exit 1
-fi
-if awk '/^  gate:/{scope=1} /^  publish:/{scope=0} scope' "$publish_workflow" | grep -q 'write'; then
-  echo 'gate job must be read-only' >&2
-  exit 1
-fi
-test "$(awk '/^  publish:/{scope=1} scope && /: write$/{count++} END{print count+0}' "$publish_workflow")" -eq 3
-grep -Fqx '          platforms: linux/amd64' "$publish_workflow"
-grep -Fqx '          load: true' "$publish_workflow"
-grep -Fqx '          provenance: false' "$publish_workflow"
-grep -Fqx '          tags: orca-slicer-api:release-gate' "$publish_workflow"
-grep -Fqx '          python3 tests/container/test_runtime.py orca-slicer-api:release-gate' "$publish_workflow"
-grep -Fqx '      - uses: docker/login-action@v3' "$publish_workflow"
-grep -Fqx '          push: true' "$publish_workflow"
-publish_gate_line=$(grep -nF '  gate:' "$publish_workflow" | cut -d: -f1)
-publish_login_line=$(grep -nF \
-  '      - uses: docker/login-action@v3' "$publish_workflow" | cut -d: -f1)
-publish_push_line=$(grep -nF '          push: true' "$publish_workflow" | cut -d: -f1)
-test -n "$publish_gate_line"
-test -n "$publish_login_line"
-test -n "$publish_push_line"
-test "$publish_gate_line" -lt "$publish_login_line"
-test "$publish_login_line" -lt "$publish_push_line"
+ruby "$root/tests/container/check_publish_workflow.rb" "$publish_workflow"
 grep -Fq 'NoNewPrivs' "$root/tests/container/test_runtime.py"
 grep -Fq 'CapBnd' "$root/tests/container/test_runtime.py"
 grep -Fq 'Tmpfs' "$root/tests/container/test_runtime.py"
-test "$(grep -Fc '          platforms: linux/amd64' "$publish_workflow")" -eq 2
-publish_attest_line=$(grep -nF '      - uses: actions/attest-build-provenance@v2' "$publish_workflow" | cut -d: -f1)
-test -n "$publish_attest_line"
-test "$publish_push_line" -lt "$publish_attest_line"
-grep -Fqx '          provenance: mode=max' "$publish_workflow"
-grep -Fqx '          sbom: true' "$publish_workflow"
-grep -Fqx '          subject-digest: ${{ steps.build.outputs.digest }}' "$publish_workflow"
-grep -Fqx '          push-to-registry: true' "$publish_workflow"
