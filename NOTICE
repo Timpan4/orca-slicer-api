@@ -1,0 +1,14 @@
+Copyright (C) 2026 Timpan4 and contributors.
+
+This repository is licensed under the GNU Affero General Public License,
+version 3 or later (AGPL-3.0-or-later). See LICENSE.
+
+Build-time third-party source:
+
+* OrcaSlicer, Copyright (C) SoftFever and contributors.
+  Source: https://github.com/SoftFever/OrcaSlicer
+  Exact commit: 8500fcdccaa10b5099ac20d252af3a7c560046f1
+  License and notices: https://github.com/SoftFever/OrcaSlicer/blob/8500fcdccaa10b5099ac20d252af3a7c560046f1/LICENSE.txt
+
+No OrcaSlicer source is redistributed in this repository. The Docker build
+fetches the exact commit and verifies its object ID before building.
