@@ -1,0 +1,11 @@
+/target
+/.rift
+/data
+/.idea
+/.vscode
+.DS_Store
+*.tmp
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

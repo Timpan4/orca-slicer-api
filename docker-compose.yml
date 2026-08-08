@@ -1,0 +1,22 @@
+services:
+  orca-slicer-api:
+    image: "${ORCA_IMAGE:-ghcr.io/timpan4/orca-slicer-api}@${ORCA_RUNTIME_DIGEST:?set ORCA_RUNTIME_DIGEST to an immutable sha256 digest}"
+    read_only: true
+    user: "10001:10001"
+    environment:
+      ORCA_IMAGE_DIGEST: "${ORCA_RUNTIME_DIGEST:?set ORCA_RUNTIME_DIGEST to an immutable sha256 digest}"
+    volumes:
+      - orca-data:/app/data
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  orca-data:
+
+networks:
+  internal:
+    internal: true
