@@ -294,6 +294,17 @@ async fn slice_materializes_trusted_process_before_applying_overrides() {
 
     let catalog = orca_slicer_api::profiles::load_profile_catalog(&profile_root).unwrap();
     let mut app_state = state(&root);
+    let mut production_contract = (*app_state.contract).clone();
+    for page in &mut production_contract.process_schema.pages {
+        for group in &mut page.groups {
+            group.options.retain(|key| key != "curr_bed_type");
+        }
+    }
+    production_contract.process_schema.options.retain(|option| option["key"] != "curr_bed_type");
+    production_contract.process_schema.scopes.remove("curr_bed_type");
+    production_contract.process_schema.samples.remove("curr_bed_type");
+    production_contract.schema_hash = process_hash(&production_contract).unwrap();
+    app_state.contract = Arc::new(production_contract);
     let schema_hash = app_state.contract.schema_hash.clone();
     app_state.profile_catalog = Arc::new(catalog);
     let app = api::router(app_state);
