@@ -41,6 +41,7 @@ pub struct AppState {
 
 const MAX_MODEL: usize = 512 * 1024 * 1024;
 const MAX_PROFILE: usize = 32 * 1024 * 1024;
+const BED_TYPE_PROFILE_KEY: &str = "curr_bed_type";
 const SLICE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 struct ProcessGroup(Option<rustix::process::Pid>);
@@ -583,9 +584,19 @@ fn apply_process_overrides(
                 "processOverrides cannot modify profile identity: {key}"
             )));
         }
-        let option = options
-            .get(key.as_str())
-            .ok_or_else(|| AppError::Bad(format!("unknown process override: {key}")))?;
+        let option = match options.get(key.as_str()) {
+            Some(option) => option,
+            None if key == BED_TYPE_PROFILE_KEY => {
+                if value.as_str().is_none() {
+                    return Err(AppError::Bad(format!("invalid value type for override: {key}")));
+                }
+                profile.insert(key.clone(), value.clone());
+                continue;
+            }
+            None => {
+                return Err(AppError::Bad(format!("unknown process override: {key}")));
+            }
+        };
         let global_scope = match contract.process_schema.scopes.get(key) {
             Some(ScopeValue::One(scope)) => scope == "global",
             Some(ScopeValue::Many(scopes)) => scopes.iter().any(|scope| scope == "global"),
