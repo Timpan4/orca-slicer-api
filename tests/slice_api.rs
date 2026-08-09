@@ -54,6 +54,7 @@ fn contract() -> Contract {
                         "support_filament".into(),
                         "support_interface_filament".into(),
                         "support_type".into(),
+                        "object_only".into(),
                     ],
                 }],
             }],
@@ -64,6 +65,7 @@ fn contract() -> Contract {
                 json!({"key":"support_filament","type":"int"}),
                 json!({"key":"support_interface_filament","type":"int"}),
                 json!({"key":"support_type","type":"enum","choices":["tree","normal"]}),
+                json!({"key":"object_only","type":"number"}),
             ],
             scopes: BTreeMap::from([
                 ("layer_height".into(), ScopeValue::One("global".into())),
@@ -72,6 +74,7 @@ fn contract() -> Contract {
                 ("support_filament".into(), ScopeValue::One("global".into())),
                 ("support_interface_filament".into(), ScopeValue::One("global".into())),
                 ("support_type".into(), ScopeValue::One("global".into())),
+                ("object_only".into(), ScopeValue::One("object".into())),
             ]),
             samples: BTreeMap::from([
                 ("layer_height".into(), json!(0.2)),
@@ -80,6 +83,7 @@ fn contract() -> Contract {
                 ("support_filament".into(), json!(0)),
                 ("support_interface_filament".into(), json!(0)),
                 ("support_type".into(), json!("normal")),
+                ("object_only".into(), json!(0.2)),
             ]),
         },
     };
@@ -347,6 +351,12 @@ async fn slice_rejects_untrusted_process_overrides_before_running_orca() {
         (r#"{"layer_height":0.3}"#, true, false, "presetProfile is required with processOverrides"),
         ("[]", true, true, "processOverrides must be a JSON object"),
         (r#"{"missing":1}"#, true, true, "unknown process override: missing"),
+        (
+            r#"{"object_only":0.3}"#,
+            true,
+            true,
+            "process override is not global-scoped: object_only",
+        ),
         (
             r#"{"name":"forged"}"#,
             true,
