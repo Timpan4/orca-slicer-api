@@ -45,11 +45,42 @@ fn contract() -> Contract {
         process_schema: ProcessSchema {
             pages: vec![Page {
                 name: "Quality".into(),
-                groups: vec![Group { name: "Layers".into(), options: vec!["layer_height".into()] }],
+                groups: vec![Group {
+                    name: "Layers".into(),
+                    options: vec![
+                        "layer_height".into(),
+                        "curr_bed_type".into(),
+                        "enable_support".into(),
+                        "support_filament".into(),
+                        "support_interface_filament".into(),
+                        "support_type".into(),
+                    ],
+                }],
             }],
-            options: vec![json!({"key":"layer_height","type":"number"})],
-            scopes: BTreeMap::from([("layer_height".into(), ScopeValue::One("global".into()))]),
-            samples: BTreeMap::from([("layer_height".into(), json!(0.2))]),
+            options: vec![
+                json!({"key":"layer_height","type":"number"}),
+                json!({"key":"curr_bed_type","type":"string"}),
+                json!({"key":"enable_support","type":"bool"}),
+                json!({"key":"support_filament","type":"int"}),
+                json!({"key":"support_interface_filament","type":"int"}),
+                json!({"key":"support_type","type":"enum","choices":["tree","normal"]}),
+            ],
+            scopes: BTreeMap::from([
+                ("layer_height".into(), ScopeValue::One("global".into())),
+                ("curr_bed_type".into(), ScopeValue::One("global".into())),
+                ("enable_support".into(), ScopeValue::One("global".into())),
+                ("support_filament".into(), ScopeValue::One("global".into())),
+                ("support_interface_filament".into(), ScopeValue::One("global".into())),
+                ("support_type".into(), ScopeValue::One("global".into())),
+            ]),
+            samples: BTreeMap::from([
+                ("layer_height".into(), json!(0.2)),
+                ("curr_bed_type".into(), json!("Textured PEI Plate")),
+                ("enable_support".into(), json!(false)),
+                ("support_filament".into(), json!(0)),
+                ("support_interface_filament".into(), json!(0)),
+                ("support_type".into(), json!("normal")),
+            ]),
         },
     };
     contract.schema_hash = process_hash(&contract).unwrap();
@@ -236,6 +267,121 @@ async fn slice_materializes_trusted_profile_stubs_and_rejects_unknown_names() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["details"], "unknown bundled process profile");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_materializes_trusted_process_before_applying_overrides() {
+    let root = test_dir("profile-overrides");
+    let profile_root = root.join("profiles");
+    for category in ["machine", "process"] {
+        fs::create_dir_all(profile_root.join(category)).unwrap();
+    }
+    fs::write(
+        profile_root.join("machine/official.json"),
+        br#"{"type":"machine","name":"Machine Official","setting_id":"machine"}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile_root.join("process/official.json"),
+        br#"{"type":"process","name":"Process Official","setting_id":"process","layer_height":0.2}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(&profile_root).unwrap();
+    let mut app_state = state(&root);
+    let schema_hash = app_state.contract.schema_hash.clone();
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    let machine_stub = r#"{"type":"machine","name":"Machine Official","inherits":"Machine Official","from":"system"}"#;
+    let process_stub = r#"{"type":"process","name":"Process Official","inherits":"Process Official","from":"system"}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), machine_stub),
+        ("presetProfile", Some("process.json"), process_stub),
+        (
+            "processOverrides",
+            None,
+            r#"{"layer_height":0.3,"curr_bed_type":"Textured PEI Plate","enable_support":true,"support_filament":2,"support_interface_filament":3,"support_type":"tree"}"#,
+        ),
+        ("schemaHash", None, &schema_hash),
+    ]);
+    let response = app
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let process: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-process.json")).unwrap()).unwrap();
+    assert_eq!(process["type"], "process");
+    assert_eq!(process["name"], "Process Official");
+    assert_eq!(process["setting_id"], "process");
+    assert_eq!(process["layer_height"], 0.3);
+    assert_eq!(process["curr_bed_type"], "Textured PEI Plate");
+    assert_eq!(process["enable_support"], true);
+    assert_eq!(process["support_filament"], 2);
+    assert_eq!(process["support_interface_filament"], 3);
+    assert_eq!(process["support_type"], "tree");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_rejects_untrusted_process_overrides_before_running_orca() {
+    let root = test_dir("invalid-process-overrides");
+    let app_state = state(&root);
+    let schema_hash = app_state.contract.schema_hash.clone();
+    let app = api::router(app_state);
+    let printer = r#"{"type":"machine","name":"Printer","setting_id":"printer"}"#;
+    let process = r#"{"type":"process","name":"Process","setting_id":"process"}"#;
+
+    for (overrides, include_schema, include_profiles, expected) in [
+        (r#"{"layer_height":0.3}"#, false, true, "schemaHash is required with processOverrides"),
+        (r#"{"layer_height":0.3}"#, true, false, "presetProfile is required with processOverrides"),
+        ("[]", true, true, "processOverrides must be a JSON object"),
+        (r#"{"missing":1}"#, true, true, "unknown process override: missing"),
+        (
+            r#"{"name":"forged"}"#,
+            true,
+            true,
+            "processOverrides cannot modify profile identity: name",
+        ),
+        (r#"{"layer_height":"thin"}"#, true, true, "invalid value type for override: layer_height"),
+    ] {
+        let mut parts = vec![("file", Some("cube.stl"), "solid cube")];
+        if include_profiles {
+            parts.push(("printerProfile", Some("printer.json"), printer));
+            parts.push(("presetProfile", Some("process.json"), process));
+        }
+        parts.push(("processOverrides", None, overrides));
+        if include_schema {
+            parts.push(("schemaHash", None, &schema_hash));
+        }
+        let (content_type, body) = multipart(&parts);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/slice")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["details"], expected);
+    }
+
+    assert!(!root.join("args.txt").exists());
     fs::remove_dir_all(root).unwrap();
 }
 

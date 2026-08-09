@@ -1,9 +1,9 @@
 use crate::{
     config::Config,
-    contract::Contract,
+    contract::{Contract, ScopeValue, validate_bounds},
     error::AppError,
     metadata,
-    model_state::validate_model_state,
+    model_state::{scalar_or_list, validate_model_state, validate_override_value},
     progress::{Progress, ProgressStore},
     storage::{field_bytes, job_dir, safe_filename, write_field},
 };
@@ -15,7 +15,11 @@ use axum::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashSet, os::unix::process::CommandExt, process::Stdio, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    os::unix::process::CommandExt,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
@@ -119,6 +123,7 @@ async fn slice_job(
     let mut schema_hash = None;
     let mut supplied_request_id = None;
     let mut model_state = None;
+    let mut process_overrides = None;
     while let Some(field) = mp.next_field().await.map_err(|e| AppError::Bad(e.to_string()))? {
         let name = field
             .name()
@@ -179,6 +184,16 @@ async fn slice_job(
                 }
                 schema_hash = Some(x);
             }
+            "processOverrides" => {
+                let bytes = field_bytes(field, MAX_PROFILE).await.map_err(AppError::Bad)?;
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| AppError::Bad("processOverrides must be a JSON object".into()))?;
+                validate_bounds(&value).map_err(AppError::Bad)?;
+                if !value.is_object() {
+                    return Err(AppError::Bad("processOverrides must be a JSON object".into()));
+                }
+                process_overrides = Some(value);
+            }
             "requestId" => {
                 let value =
                     String::from_utf8(field_bytes(field, 128).await.map_err(AppError::Bad)?)
@@ -219,6 +234,12 @@ async fn slice_job(
             s.contract.schema_hash
         )));
     }
+    if process_overrides.is_some() && schema_hash.is_none() {
+        return Err(AppError::Bad("schemaHash is required with processOverrides".into()));
+    }
+    if process_overrides.is_some() && preset.is_none() {
+        return Err(AppError::Bad("presetProfile is required with processOverrides".into()));
+    }
     if model_state.is_some() && schema_hash.is_none() {
         return Err(AppError::Bad("schemaHash is required with modelState".into()));
     }
@@ -227,6 +248,14 @@ async fn slice_job(
     }
     if model_state.is_some() && s.config.bridge_path.is_none() {
         return Err(AppError::Bad("modelState requires configured bridge".into()));
+    }
+    if let Some(overrides) = process_overrides.as_ref() {
+        let path = preset.as_ref().ok_or_else(|| {
+            AppError::Bad("presetProfile is required with processOverrides".into())
+        })?;
+        let profile = tokio::fs::read(path).await?;
+        let merged = apply_process_overrides(&profile, overrides, &s.contract)?;
+        tokio::fs::write(path, merged).await?;
     }
     let progress_id = supplied_request_id.as_deref().unwrap_or(request_id);
     if !s
@@ -524,6 +553,55 @@ fn progress_from_json(value: &Value, default_plate: Option<u32>) -> Progress {
             .and_then(|number| u32::try_from(number).ok()),
         updated_at: 0,
     }
+}
+
+fn apply_process_overrides(
+    profile_bytes: &[u8],
+    overrides: &Value,
+    contract: &Contract,
+) -> Result<Vec<u8>, AppError> {
+    let overrides = overrides
+        .as_object()
+        .ok_or_else(|| AppError::Bad("processOverrides must be a JSON object".into()))?;
+    let options = contract
+        .process_schema
+        .options
+        .iter()
+        .filter_map(|option| option.get("key").and_then(Value::as_str).map(|key| (key, option)))
+        .collect::<HashMap<_, _>>();
+    let mut profile: Value = serde_json::from_slice(profile_bytes)?;
+    let profile = profile
+        .as_object_mut()
+        .ok_or_else(|| AppError::Bad("resolved process profile must be a JSON object".into()))?;
+
+    for (key, value) in overrides {
+        if matches!(
+            key.as_str(),
+            "type" | "name" | "setting_id" | "inherits" | "from" | "instantiation"
+        ) {
+            return Err(AppError::Bad(format!(
+                "processOverrides cannot modify profile identity: {key}"
+            )));
+        }
+        let option = options
+            .get(key.as_str())
+            .ok_or_else(|| AppError::Bad(format!("unknown process override: {key}")))?;
+        let global_scope = match contract.process_schema.scopes.get(key) {
+            Some(ScopeValue::One(scope)) => scope == "global",
+            Some(ScopeValue::Many(scopes)) => scopes.iter().any(|scope| scope == "global"),
+            None => false,
+        };
+        if !global_scope {
+            return Err(AppError::Bad(format!("process override is not global-scoped: {key}")));
+        }
+        if !scalar_or_list(value) {
+            return Err(AppError::Bad(format!("invalid process override: {key}")));
+        }
+        validate_override_value(key, option, value)?;
+        profile.insert(key.clone(), value.clone());
+    }
+
+    Ok(serde_json::to_vec(&profile)?)
 }
 
 async fn profile_bytes(
