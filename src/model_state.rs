@@ -129,7 +129,11 @@ fn validate_vector(value: &Value, positive: bool, name: &str) -> Result<(), AppE
     Ok(())
 }
 
-fn validate_override_value(key: &str, option: &Value, value: &Value) -> Result<(), AppError> {
+pub(crate) fn validate_override_value(
+    key: &str,
+    option: &Value,
+    value: &Value,
+) -> Result<(), AppError> {
     if value.is_null() {
         return if option.get("nullable").and_then(Value::as_bool) == Some(true) {
             Ok(())
@@ -151,23 +155,23 @@ fn validate_override_value(key: &str, option: &Value, value: &Value) -> Result<(
         _ => false,
     };
     if !valid_type {
-        return Err(AppError::Bad(format!("invalid value type for object override: {key}")));
+        return Err(AppError::Bad(format!("invalid value type for override: {key}")));
     }
     if let Some(number) = value.as_f64()
         && (option.get("min").and_then(Value::as_f64).is_some_and(|minimum| number < minimum)
             || option.get("max").and_then(Value::as_f64).is_some_and(|maximum| number > maximum))
     {
-        return Err(AppError::Bad(format!("object override is out of range: {key}")));
+        return Err(AppError::Bad(format!("override is out of range: {key}")));
     }
     if let Some(choices) = option.get("choices").and_then(Value::as_array)
         && !choices.contains(value)
     {
-        return Err(AppError::Bad(format!("object override is not an allowed choice: {key}")));
+        return Err(AppError::Bad(format!("override is not an allowed choice: {key}")));
     }
     Ok(())
 }
 
-fn scalar_or_list(v: &Value) -> bool {
+pub(crate) fn scalar_or_list(v: &Value) -> bool {
     match v {
         Value::String(_) | Value::Bool(_) | Value::Number(_) | Value::Null => true,
         Value::Array(a) => a.iter().all(scalar_or_list) && a.len() <= 256,
