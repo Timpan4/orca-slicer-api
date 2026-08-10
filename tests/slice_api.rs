@@ -544,15 +544,15 @@ fn profile_catalog_fails_closed_for_invalid_inheritance() {
 }
 
 #[test]
-fn profile_catalog_rejects_same_vendor_ambiguous_inheritance() {
+fn profile_catalog_rejects_same_directory_ambiguous_inheritance() {
     let root = test_dir("profile-inheritance-scoped-ambiguity");
-    fs::create_dir_all(root.join("Vendor/process/nested")).unwrap();
+    fs::create_dir_all(root.join("Vendor/process")).unwrap();
     fs::write(
         root.join("Vendor/process/child.json"),
         br#"{"type":"process","name":"Child","inherits":"Parent","setting_id":"child"}"#,
     )
     .unwrap();
-    for path in ["Vendor/process/parent.json", "Vendor/process/nested/parent.json"] {
+    for path in ["Vendor/process/parent-a.json", "Vendor/process/parent-b.json"] {
         fs::write(
             root.join(path),
             br#"{"type":"process","name":"Parent","instantiation":"false"}"#,
