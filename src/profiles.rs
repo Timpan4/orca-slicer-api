@@ -419,6 +419,7 @@ fn load_profile_manifests(root: &Path, catalog: &mut ProfileCatalog) -> Result<(
                 .as_array()
                 .ok_or_else(|| format!("{}: {list} must be an array", path.display()))?;
             catalog.manifests_loaded = true;
+            let mut manifest_paths = HashSet::new();
             for (order, manifest_entry) in manifest_entries.iter().enumerate() {
                 let manifest_entry = manifest_entry
                     .as_object()
@@ -439,6 +440,12 @@ fn load_profile_manifests(root: &Path, catalog: &mut ProfileCatalog) -> Result<(
                 {
                     return Err(format!(
                         "{}: invalid manifest sub_path: {sub_path}",
+                        path.display()
+                    ));
+                }
+                if !manifest_paths.insert(sub_path.clone()) {
+                    return Err(format!(
+                        "{}: duplicate {profile_type} manifest sub_path: {sub_path}",
                         path.display()
                     ));
                 }

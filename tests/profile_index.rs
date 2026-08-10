@@ -248,6 +248,40 @@ fn inherited_profiles_prefer_exact_filename_over_legacy_duplicate() {
 }
 
 #[test]
+fn duplicate_manifest_sub_path_is_rejected() {
+    let root = std::env::temp_dir()
+        .join(format!("orca-profile-duplicate-manifest-path-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("vendor/process")).unwrap();
+    fs::write(
+        root.join("vendor/process/profile.json"),
+        serde_json::to_vec(&json!({
+            "type": "process",
+            "name": "Profile",
+            "setting_id": "profile"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("vendor.json"),
+        serde_json::to_vec(&json!({
+            "name": "vendor",
+            "process_list": [
+                {"name": "Profile", "sub_path": "process/profile.json"},
+                {"name": "Profile", "sub_path": "process/profile.json"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = load_profile_catalog(&root).unwrap_err();
+    assert!(error.contains("duplicate process manifest sub_path: process/profile.json"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn profile_index_rejects_ambiguous_active_inheritance() {
     let root =
         std::env::temp_dir().join(format!("orca-profile-index-ambiguous-{}", std::process::id()));
