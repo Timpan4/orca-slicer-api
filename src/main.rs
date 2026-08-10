@@ -12,10 +12,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     contract.image_identity.digest.clone_from(&config.image_digest);
     let (bundled_profiles, profile_catalog) =
         match (config.profiles_path.as_ref(), config.profile_source_path.as_ref()) {
-            (Some(index_path), Some(source_path)) => (
-                profiles::load_profile_index(index_path).map_err(std::io::Error::other)?,
-                profiles::load_profile_catalog(source_path).map_err(std::io::Error::other)?,
-            ),
+            (Some(index_path), Some(source_path)) => {
+                let catalog =
+                    profiles::load_profile_catalog(source_path).map_err(std::io::Error::other)?;
+                let index =
+                    profiles::load_profile_index(index_path).map_err(std::io::Error::other)?;
+                (
+                    profiles::ProfileCatalog::decorate_index(&catalog, index)
+                        .map_err(std::io::Error::other)?,
+                    catalog,
+                )
+            }
             (None, None) => (
                 serde_json::json!({"printer": [], "process": [], "filament": []}),
                 Default::default(),
