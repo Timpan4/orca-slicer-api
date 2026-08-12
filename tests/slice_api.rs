@@ -415,13 +415,18 @@ async fn slice_materializes_trusted_profile_inheritance() {
         fs::create_dir_all(vendor_root.join(category)).unwrap();
     }
     fs::write(
+        vendor_root.join("machine/printer-parent.json"),
+        br#"{"type":"machine","name":"Bambu Lab X1 Carbon base","setting_id":"GM000","instantiation":"false"}"#,
+    )
+    .unwrap();
+    fs::write(
         vendor_root.join("machine/printer.json"),
-        br#"{"type":"machine","name":"Bambu Lab X1 Carbon 0.4 nozzle","setting_id":"GM001"}"#,
+        br#"{"type":"machine","name":"Bambu Lab X1 Carbon 0.4 nozzle","setting_id":"GM001","inherits":"Bambu Lab X1 Carbon base"}"#,
     )
     .unwrap();
     fs::write(
         vendor_root.join("process/process.json"),
-        br#"{"type":"process","name":"0.20mm Standard @BBL X1C","setting_id":"GP004"}"#,
+        br#"{"type":"process","name":"0.20mm Standard @BBL X1C","setting_id":"GP004","compatible_printers":["Bambu Lab X1 Carbon base"]}"#,
     )
     .unwrap();
     fs::write(
@@ -472,6 +477,174 @@ async fn slice_materializes_trusted_profile_inheritance() {
     assert_eq!(materialized["filament_density"], json!(["1.26"]));
     assert_eq!(materialized["filament_diameter"], json!(["1.75"]));
     assert_eq!(materialized["compatible_printers"], json!(["Bambu Lab X1 Carbon 0.4 nozzle"]));
+    let process: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-process.json")).unwrap()).unwrap();
+    assert_eq!(process["compatible_printers"], json!(["Bambu Lab X1 Carbon base"]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_rejects_custom_parents_excluded_by_manifests() {
+    let root = test_dir("custom-profile-manifest-authority");
+    let vendor_root = root.join("profiles/Vendor");
+    fs::create_dir_all(vendor_root.join("machine")).unwrap();
+    fs::write(
+        root.join("profiles/Vendor.json"),
+        br#"{"machine_list":[{"name":"Declared Parent","sub_path":"machine/declared.json"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        vendor_root.join("machine/declared.json"),
+        br#"{"type":"machine","name":"Declared Parent","setting_id":"declared"}"#,
+    )
+    .unwrap();
+    fs::write(
+        vendor_root.join("machine/undeclared.json"),
+        br#"{"type":"machine","name":"Undeclared Parent","setting_id":"undeclared"}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(root.join("profiles")).unwrap();
+    let mut app_state = state(&root);
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    let custom_machine = r#"{"type":"machine","name":"Custom Printer","setting_id":"custom","inherits":"Undeclared Parent"}"#;
+    let process = r#"{"type":"process","name":"Process","setting_id":"process"}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), custom_machine),
+        ("presetProfile", Some("process.json"), process),
+    ]);
+    let response = app
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["details"], "missing bundled machine parent profile: Undeclared Parent");
+    assert!(!root.join("args.txt").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_materializes_custom_profiles_over_bundled_parents() {
+    let root = test_dir("custom-profile-inheritance");
+    let vendor_root = root.join("profiles/Voron");
+    for category in ["machine", "process", "filament"] {
+        fs::create_dir_all(vendor_root.join(category)).unwrap();
+    }
+    fs::write(
+        vendor_root.join("machine/printer.json"),
+        br#"{"type":"machine","name":"Voron 2.4 300 0.4 nozzle","setting_id":"base-machine","machine_max_speed_x":["600"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        vendor_root.join("process/process.json"),
+        br#"{"type":"process","name":"0.20mm Standard @Voron","setting_id":"base-process","compatible_printers":["Voron 2.4 300 0.4 nozzle"],"layer_height":["0.2"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        vendor_root.join("filament/filament.json"),
+        br#"{"type":"filament","name":"Generic TPU @System","setting_id":"base-filament","filament_diameter":["1.75"]}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(root.join("profiles")).unwrap();
+    let mut app_state = state(&root);
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    let custom_machine = r#"{"type":"machine","name":"Voron 2.4 300 0.4 nozzle - my","setting_id":"custom-machine","inherits":"Voron 2.4 300 0.4 nozzle","machine_max_speed_x":["700"]}"#;
+    let custom_process = r#"{"type":"process","name":"0.20mm Standard @Voron - My","setting_id":"custom-process","inherits":"0.20mm Standard @Voron","line_width":["110%"]}"#;
+    let custom_filament = r#"{"type":"filament","name":"Inslogic 95A TPU @System","setting_id":"custom-filament","inherits":"Generic TPU @System","filament_density":["1.23"]}"#;
+    let (content_type, body) = multipart(&[
+        ("file", Some("cube.stl"), "solid cube"),
+        ("printerProfile", Some("printer.json"), custom_machine),
+        ("presetProfile", Some("process.json"), custom_process),
+        ("filamentProfile", Some("filament.json"), custom_filament),
+    ]);
+    let response = app
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let machine: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-printer.json")).unwrap()).unwrap();
+    let process: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-process.json")).unwrap()).unwrap();
+    let filament: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("captured-filament.json")).unwrap()).unwrap();
+    assert_eq!(machine["machine_max_speed_x"], json!(["700"]));
+    assert_eq!(process["layer_height"], json!(["0.2"]));
+    assert_eq!(process["line_width"], json!(["110%"]));
+    assert_eq!(
+        process["compatible_printers"],
+        json!(["Voron 2.4 300 0.4 nozzle", "Voron 2.4 300 0.4 nozzle - my"])
+    );
+    assert_eq!(filament["filament_diameter"], json!(["1.75"]));
+    assert_eq!(filament["filament_density"], json!(["1.23"]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn slice_rejects_unresolvable_custom_profile_parents() {
+    let root = test_dir("custom-profile-parent-errors");
+    for vendor in ["VendorA", "VendorB"] {
+        fs::create_dir_all(root.join(format!("profiles/{vendor}/machine"))).unwrap();
+    }
+    fs::write(
+        root.join("profiles/VendorA/machine/first.json"),
+        br#"{"type":"machine","name":"Shared Parent","setting_id":"first","instantiation":"false"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("profiles/VendorB/machine/second.json"),
+        br#"{"type":"machine","name":"Shared Parent","setting_id":"second","instantiation":"false"}"#,
+    )
+    .unwrap();
+
+    let catalog = orca_slicer_api::profiles::load_profile_catalog(root.join("profiles")).unwrap();
+    let mut app_state = state(&root);
+    app_state.profile_catalog = Arc::new(catalog);
+    let app = api::router(app_state);
+    for (parent, expected) in [
+        ("Missing Parent", "missing bundled machine parent profile: Missing Parent"),
+        ("Shared Parent", "ambiguous bundled machine parent profile: Shared Parent"),
+    ] {
+        let custom_machine = format!(
+            r#"{{"type":"machine","name":"Custom Printer","setting_id":"custom","inherits":"{parent}"}}"#
+        );
+        let (content_type, body) = multipart(&[
+            ("file", Some("cube.stl"), "solid cube"),
+            ("printerProfile", Some("printer.json"), &custom_machine),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/slice")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["details"], expected);
+    }
+    assert!(!root.join("args.txt").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -620,17 +793,17 @@ async fn slice_uses_layercove_wire_and_returns_artifact_headers() {
         (
             "presetProfile",
             Some("preset.json"),
-            r#"{"type":"process","name":"Preset","setting_id":"preset","inherits":"Base Process"}"#,
+            r#"{"type":"process","name":"Preset","setting_id":"preset"}"#,
         ),
         (
             "filamentProfile",
             Some("filament-1.json"),
-            r#"{"type":"filament","name":"Filament 1","setting_id":"filament-1","inherits":"Base Filament"}"#,
+            r#"{"type":"filament","name":"Filament 1","setting_id":"filament-1"}"#,
         ),
         (
             "filamentProfile",
             Some("filament-2.json"),
-            r#"{"type":"filament","name":"Filament 2","setting_id":"filament-2","inherits":"Base Filament"}"#,
+            r#"{"type":"filament","name":"Filament 2","setting_id":"filament-2"}"#,
         ),
         ("plate", None, "0"),
         ("exportType", None, "3mf"),
