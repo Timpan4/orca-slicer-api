@@ -94,6 +94,37 @@ impl ProfileCatalog {
         serde_json::to_vec(&Value::Object(value)).map(Some).map_err(|error| error.to_string())
     }
 
+    pub fn materialize_custom(
+        &self,
+        profile_type: &str,
+        child: &Map<String, Value>,
+    ) -> Result<Vec<u8>, String> {
+        let parent = child
+            .get("inherits")
+            .and_then(Value::as_str)
+            .filter(|parent| !parent.is_empty())
+            .ok_or_else(|| format!("{profile_type} profile inherits must be a non-empty string"))?;
+        let candidates = if self.manifests_loaded {
+            self.manifest
+                .iter()
+                .filter_map(|((_, candidate_type, candidate_name), index)| {
+                    (candidate_type == profile_type && candidate_name == parent).then_some(*index)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.global.get(&(profile_type.into(), parent.into())).cloned().unwrap_or_default()
+        };
+        let parent_index = self
+            .select_parent(&candidates, profile_type, parent)?
+            .ok_or_else(|| format!("missing bundled {profile_type} parent profile: {parent}"))?;
+        let mut merged = self.resolve_object(parent_index, &mut HashSet::new())?;
+        merged.remove("instantiation");
+        for (key, value) in child {
+            merged.insert(key.clone(), value.clone());
+        }
+        serde_json::to_vec(&Value::Object(merged)).map_err(|error| error.to_string())
+    }
+
     fn resolve_value(
         &self,
         profile_type: &str,

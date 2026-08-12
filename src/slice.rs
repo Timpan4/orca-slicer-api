@@ -116,6 +116,7 @@ async fn slice_job(
     let mut seen = HashSet::new();
     let mut model: Option<std::path::PathBuf> = None;
     let mut printer = None;
+    let mut printer_is_custom = false;
     let mut preset = None;
     let mut filaments = Vec::new();
     let mut plate = None;
@@ -144,10 +145,11 @@ async fn slice_job(
             }
             "printerProfile" | "presetProfile" => {
                 let expected = if name == "printerProfile" { "machine" } else { "process" };
-                let bytes = profile_bytes(field, expected, &s.profile_catalog).await?;
+                let profile = profile_bytes(field, expected, &s.profile_catalog).await?;
                 let path = dir.join(&name);
-                tokio::fs::write(&path, bytes).await?;
+                tokio::fs::write(&path, profile.bytes).await?;
                 if name == "printerProfile" {
+                    printer_is_custom = profile.custom;
                     printer = Some(path);
                 } else {
                     preset = Some(path);
@@ -157,9 +159,9 @@ async fn slice_job(
                 if filaments.len() == 16 {
                     return Err(AppError::Bad("maximum 16 filament profiles".into()));
                 }
-                let bytes = profile_bytes(field, "filament", &s.profile_catalog).await?;
+                let profile = profile_bytes(field, "filament", &s.profile_catalog).await?;
                 let path = dir.join(format!("filament_{}", filaments.len()));
-                tokio::fs::write(&path, bytes).await?;
+                tokio::fs::write(&path, profile.bytes).await?;
                 filaments.push(path);
             }
             "plate" => {
@@ -226,6 +228,9 @@ async fn slice_job(
             "printerProfile, presetProfile, and filamentProfile must form a complete profile set"
                 .into(),
         ));
+    }
+    if printer_is_custom && let (Some(printer_path), Some(process_path)) = (&printer, &preset) {
+        allow_custom_printer_for_compatible_process(printer_path, process_path).await?;
     }
     if let Some(hash) = &schema_hash
         && hash != &s.contract.schema_hash
@@ -615,11 +620,16 @@ fn apply_process_overrides(
     Ok(serde_json::to_vec(&profile)?)
 }
 
+struct PreparedProfile {
+    bytes: Vec<u8>,
+    custom: bool,
+}
+
 async fn profile_bytes(
     field: axum::extract::multipart::Field<'_>,
     expected: &str,
     catalog: &crate::profiles::ProfileCatalog,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<PreparedProfile, AppError> {
     let bytes = field_bytes(field, MAX_PROFILE).await.map_err(AppError::Bad)?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::Bad(format!("{expected} profile must be a JSON object")))?;
@@ -645,23 +655,54 @@ async fn profile_bytes(
             if name != inherits {
                 return Err(AppError::Bad("bundled profile name must match inherits".into()));
             }
-            return catalog
+            let bytes = catalog
                 .resolve(expected, inherits)
                 .map_err(AppError::Bad)?
-                .ok_or_else(|| AppError::Bad(format!("unknown bundled {expected} profile")));
+                .ok_or_else(|| AppError::Bad(format!("unknown bundled {expected} profile")))?;
+            return Ok(PreparedProfile { bytes, custom: false });
         }
         return Err(AppError::Bad(format!(
             "{expected} profile requires type, name, and setting_id"
         )));
     }
-    if let Some(inherits) = object.get("inherits")
-        && inherits.as_str().is_none_or(str::is_empty)
-    {
-        return Err(AppError::Bad(format!(
-            "{expected} profile inherits must be a non-empty string"
-        )));
+    if let Some(inherits) = object.get("inherits") {
+        if inherits.as_str().is_none_or(str::is_empty) {
+            return Err(AppError::Bad(format!(
+                "{expected} profile inherits must be a non-empty string"
+            )));
+        }
+        let bytes = catalog.materialize_custom(expected, object).map_err(AppError::Bad)?;
+        return Ok(PreparedProfile { bytes, custom: true });
     }
-    Ok(bytes)
+    Ok(PreparedProfile { bytes, custom: false })
+}
+
+async fn allow_custom_printer_for_compatible_process(
+    printer_path: &std::path::Path,
+    process_path: &std::path::Path,
+) -> Result<(), AppError> {
+    let printer_bytes = tokio::fs::read(printer_path).await?;
+    let printer: Value = serde_json::from_slice(&printer_bytes)?;
+    let Some(printer_name) = printer.get("name").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(printer_parent) = printer.get("inherits").and_then(Value::as_str) else {
+        return Ok(());
+    };
+
+    let process_bytes = tokio::fs::read(process_path).await?;
+    let mut process: Value = serde_json::from_slice(&process_bytes)?;
+    let Some(compatible) = process.get_mut("compatible_printers").and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    if compatible.iter().any(|name| name.as_str() == Some(printer_parent))
+        && !compatible.iter().any(|name| name.as_str() == Some(printer_name))
+    {
+        compatible.push(Value::String(printer_name.into()));
+        tokio::fs::write(process_path, serde_json::to_vec(&process)?).await?;
+    }
+    Ok(())
 }
 
 fn parse_u32(b: Vec<u8>) -> Result<u32, AppError> {
