@@ -19,6 +19,7 @@ printf '%s\n' \
   '/src/libslic3r/PrintConfig.cpp' \
   '/src/libslic3r/PrintConfig.hpp' \
   '/src/libslic3r/PrintConfigConstants.hpp' \
+  '/src/libslic3r/Preset.cpp' \
   '/resources/profiles/' \
   '/LICENSE.txt' \
   >"$destination/.git/info/sparse-checkout"

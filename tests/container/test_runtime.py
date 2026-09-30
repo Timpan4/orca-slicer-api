@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
 IMAGE = sys.argv[1] if len(sys.argv) == 2 else (_ for _ in ()).throw(SystemExit("usage: test_runtime.py IMAGE"))
@@ -139,6 +140,16 @@ try:
         assert len(schema["options"]) == len(schema["scopes"]) == len(schema["samples"]) == 342
         profiles_json = get_json(f"{base}/profiles/bundled")
         assert profiles_json.get("printer") and profiles_json.get("process") and profiles_json.get("filament")
+        for kind in ("printer", "filament"):
+            profile_schema = get_json(f"{base}/schema/{kind}")
+            assert profile_schema["schema_hash"] == schema_hash(profile_schema)
+            assert profile_schema["engine"] == health["engine"]
+            assert profile_schema["image_identity"] == health["image_identity"]
+            assert profile_schema["options"]
+        with tempfile.TemporaryDirectory(prefix="orca-calibration-artifacts-") as artifacts:
+            for provider in ("bambu", "klipper"):
+                subprocess.run([sys.executable, str(Path(__file__).with_name("test_calibration.py")),
+                                base, str(Path(artifacts) / provider), provider], check=True)
         request_id = f"real-stl-{SUFFIX}"
         command = ["curl", "--silent", "--show-error", "--fail-with-body", "--dump-header", HEADERS, "--output", ARTIFACT,
                    "--form", f"file=@{CUBE};type=application/sla", "--form", f"printerProfile=@{profiles}/printer.json;type=application/json",

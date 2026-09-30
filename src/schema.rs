@@ -44,7 +44,7 @@ pub fn build_process_schema(
     if let Some(key) = placed.iter().find(|key| !unique.insert(key.as_str())) {
         return Err(format!("duplicate placed option: {key}"));
     }
-    let parsed = parse_source(sources)?;
+    let parsed = parse_source(&sources)?;
     let mut options = Vec::with_capacity(placed.len());
     let mut scopes = BTreeMap::new();
     let mut samples = BTreeMap::new();
@@ -71,7 +71,7 @@ pub fn build_process_schema(
     Ok(ProcessSchema { pages, options, scopes, samples })
 }
 
-fn parse_source(sources: OrcaSources<'_>) -> Result<ParsedSource, String> {
+fn parse_source(sources: &OrcaSources<'_>) -> Result<ParsedSource, String> {
     let print_config = strip_cpp_comments(sources.print_config)?;
     let header = strip_cpp_comments(sources.print_config_header)?;
     let (options, aliases, duplicate_options) = parse_option_blocks(&print_config)?;
@@ -85,6 +85,120 @@ fn parse_source(sources: OrcaSources<'_>) -> Result<ParsedSource, String> {
         object_keys: parse_object_keys(&header)?,
         duplicate_options,
     })
+}
+
+/// Export the actual preset key lists, including printer nozzle/motion options.
+/// Orca source is input data here; this does not link or compile Orca.
+pub fn build_profile_schema(
+    sources: OrcaSources<'_>,
+    preset_source: &str,
+    kind: &str,
+) -> Result<ProcessSchema, String> {
+    let mut parsed = parse_source(&sources)?;
+    expand_axis_options(&mut parsed, sources.print_config)?;
+    // These two unconditional definitions occur twice in the pinned constructor.
+    // ConfigDef::add replaces the earlier definition; parse_option_blocks already retains the last.
+    for key in ["retract_lift_above", "retract_lift_below"] {
+        parsed.duplicate_options.remove(key);
+    }
+    let source = strip_cpp_comments(preset_source)?;
+    let list = |name: &str| -> Result<Vec<String>, String> {
+        let marker = format!("s_Preset_{name}_options");
+        let start = source.find(&marker).ok_or_else(|| format!("missing {marker}"))?;
+        let body = &source[start..];
+        let open = body.find('{').ok_or("missing preset list")?;
+        let close = matching_delimiter(body, open, '{', '}').ok_or("unclosed preset list")?;
+        cpp_strings(&body[open + 1..close])
+    };
+    let mut keys = list(kind)?;
+    if kind == "printer" {
+        keys.extend(list("machine_limits")?);
+        let config = strip_cpp_comments(sources.print_config)?;
+        let body = config
+            .split_once("void PrintConfigDef::init_extruder_option_keys()")
+            .ok_or("extruder option keys not found")?
+            .1;
+        let body = body.split_once("m_extruder_option_keys").ok_or("extruder keys not found")?.1;
+        let open = body.find('{').ok_or("extruder key list missing")?;
+        let close = matching_delimiter(body, open, '{', '}').ok_or("extruder list unclosed")?;
+        keys.extend(cpp_strings(&body[open + 1..close])?);
+    } else if kind != "filament" {
+        return Err("profile schema must be printer or filament".into());
+    }
+    let config = strip_cpp_comments(sources.print_config)?;
+    let override_body = config
+        .split_once("filament_extruder_override_keys =")
+        .ok_or("filament override keys missing")?
+        .1;
+    let open = override_body.find('{').ok_or("override list missing")?;
+    let close =
+        matching_delimiter(override_body, open, '{', '}').ok_or("override list unclosed")?;
+    for key in cpp_strings(&override_body[open + 1..close])? {
+        let original = key.strip_prefix("filament_").ok_or("invalid filament override key")?;
+        if let Some(option) = parsed.options.get(original).cloned() {
+            // The pinned loop copies metadata/defaults from the extruder option and makes it nullable.
+            parsed.options.insert(key, RawOption { nullable: true, ..option });
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    let mut options = Vec::new();
+    let mut samples = BTreeMap::new();
+    let mut scopes = BTreeMap::new();
+    for key in &keys {
+        let option = option_json(key, &parsed)?;
+        samples.insert(key.clone(), option["default"].clone());
+        scopes.insert(key.clone(), ScopeValue::One("global".into()));
+        options.push(option);
+    }
+    Ok(ProcessSchema {
+        pages: vec![Page {
+            name: kind.into(),
+            groups: vec![Group { name: "Settings".into(), options: keys }],
+        }],
+        options,
+        samples,
+        scopes,
+    })
+}
+
+fn expand_axis_options(parsed: &mut ParsedSource, source: &str) -> Result<(), String> {
+    let source = strip_cpp_comments(source)?;
+    let body = source.split_once("std::vector<AxisDefault> axes").ok_or("axis defaults missing")?.1;
+    let open = body.find('{').ok_or("axis defaults missing")?;
+    let close = matching_delimiter(body, open, '{', '}').ok_or("axis defaults unclosed")?;
+    for entry in braced_entries(&body[open + 1..close]) {
+        let fields = split_top_level(entry, ',');
+        if fields.len() != 4 {
+            return Err("axis default requires a name and three vectors".into());
+        }
+        let axis = cpp_strings(fields[0])?.into_iter().next().ok_or("axis name missing")?;
+        for (index, (key, field, label)) in [
+            ("machine_max_speed_", "max_feedrate", "Maximum speed"),
+            ("machine_max_acceleration_", "max_acceleration", "Maximum acceleration"),
+            ("machine_max_jerk_", "max_jerk", "Maximum jerk"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = format!("this->add(\"{key}\" + axis.name");
+            let start =
+                source.find(&marker).ok_or_else(|| format!("axis option missing: {key}"))?;
+            let end = source[start + marker.len()..]
+                .find("this->add(")
+                .map_or(source.len(), |relative| start + marker.len() + relative);
+            let block = source[start..end].replace(
+                &format!("ConfigOptionFloats(axis.{field})"),
+                &format!("ConfigOptionFloats{}", fields[index + 1]),
+            );
+            let block = format!("{block}\ndef->label = \"{label} {}\";", axis.to_uppercase());
+            parsed.options.insert(
+                format!("{key}{axis}"),
+                RawOption { option_type: "coFloats".into(), block, nullable: false },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_option_blocks(source: &str) -> Result<OptionBlocks, String> {
@@ -133,7 +247,7 @@ fn option_json(key: &str, parsed: &ParsedSource) -> Result<Value, String> {
         .ok_or_else(|| format!("layout option missing source metadata: {key}"))?;
     let label = string_field(key, "full_label", parsed, &mut HashSet::new())?
         .or(string_field(key, "label", parsed, &mut HashSet::new())?)
-        .ok_or_else(|| format!("source option missing label: {key}"))?;
+        .unwrap_or_else(|| key.to_owned());
     let tooltip = string_field(key, "tooltip", parsed, &mut HashSet::new())?.unwrap_or_default();
     let units = string_field(key, "sidetext", parsed, &mut HashSet::new())?;
     let mode = match assignment(&option.block, "mode") {
@@ -159,6 +273,9 @@ fn option_json(key: &str, parsed: &ParsedSource) -> Result<Value, String> {
         ("nullable".into(), Value::Bool(nullable)),
         ("default".into(), parse_default(key, option, parsed)?),
     ]);
+    if let Some(item_type) = array_item_type(&option.option_type) {
+        value.insert("item_type".into(), Value::String(item_type.into()));
+    }
     if let Some(minimum) = numeric_field(key, "min", parsed, &mut HashSet::new())? {
         value.insert("min".into(), number_value(minimum)?);
     }
@@ -173,16 +290,15 @@ fn option_json(key: &str, parsed: &ParsedSource) -> Result<Value, String> {
                 "coFloat" | "coPercent" => {
                     Ok(number_value(parse_number(&choice, &parsed.constants)?)?)
                 }
-                "coInt" => {
-                    let number = parse_number(&choice, &parsed.constants)?;
-                    if number.fract() != 0.0 {
-                        Err(format!("integer choice is not integral for {key}: {choice}"))
-                    } else {
-                        Ok(Value::Number(Number::from(number as i64)))
-                    }
-                }
+                "coInt" => integer_value(parse_number(&choice, &parsed.constants)?),
                 "coBool" => Ok(Value::Bool(parse_bool(&choice, &parsed.constants)?)),
-                "coString" | "coEnum" | "coFloatOrPercent" => Ok(Value::String(choice)),
+                "coString" | "coEnum" | "coFloatOrPercent" | "coStrings" | "coEnums" => {
+                    Ok(Value::String(choice))
+                }
+                "coInts" => integer_value(parse_number(&choice, &parsed.constants)?),
+                "coFloats" | "coPercents" => {
+                    number_value(parse_number(&choice, &parsed.constants)?)
+                }
                 _ => Err(format!(
                     "choices are unsupported for option type {}: {key}",
                     option.option_type
@@ -203,9 +319,26 @@ fn schema_type(option_type: &str) -> Result<&'static str, String> {
         "coFloatOrPercent" => Ok("float_or_percent"),
         "coBool" => Ok("bool"),
         "coEnum" => Ok("enum"),
+        "coPoint" => Ok("point"),
+        "coPoint3" => Ok("point3"),
         "coFloats" | "coInts" | "coStrings" | "coPercents" | "coFloatsOrPercents" | "coPoints"
         | "coBools" | "coEnums" | "coPointsGroups" | "coIntsGroups" => Ok("array"),
         other => Err(format!("unsupported source option type: {other}")),
+    }
+}
+
+fn array_item_type(option_type: &str) -> Option<&'static str> {
+    match option_type {
+        "coFloats" => Some("float"),
+        "coInts" => Some("int"),
+        "coStrings" => Some("string"),
+        "coPercents" => Some("percent"),
+        "coFloatsOrPercents" => Some("float_or_percent"),
+        "coBools" => Some("bool"),
+        "coEnums" => Some("enum"),
+        "coPoints" => Some("point"),
+        "coPointsGroups" | "coIntsGroups" => Some("array"),
+        _ => None,
     }
 }
 
@@ -214,18 +347,97 @@ fn parse_default(key: &str, option: &RawOption, parsed: &ParsedSource) -> Result
         .ok_or_else(|| format!("source option missing default: {key}"))?;
     match option.option_type.as_str() {
         "coFloat" | "coPercent" => number_value(parse_number(&arguments, &parsed.constants)?),
-        "coInt" => {
-            let number = parse_number(&arguments, &parsed.constants)?;
-            if number.fract() != 0.0 {
-                return Err(format!("integer default is not integral for {key}: {arguments}"));
-            }
-            Ok(Value::Number(Number::from(number as i64)))
-        }
+        "coInt" => integer_value(parse_number(&arguments, &parsed.constants)?),
         "coBool" => Ok(Value::Bool(parse_bool(&arguments, &parsed.constants)?)),
         "coString" => Ok(Value::String(cpp_strings(&arguments)?.join(""))),
         "coStrings" => {
             Ok(serde_json::to_value(cpp_strings(&arguments)?).map_err(|e| e.to_string())?)
         }
+        "coFloats" | "coInts" | "coPercents" | "coBools" => {
+            let body = arguments.trim().trim_start_matches('{').trim_end_matches('}');
+            let parts = split_top_level(body, ',');
+            let initializer = option
+                .block
+                .split_once("set_default_value(new")
+                .and_then(|(_, rest)| {
+                    rest.find(['(', '{']).map(|index| rest.as_bytes()[index] == b'{')
+                })
+                .unwrap_or(false);
+            let parts = if parts.len() == 2 && !initializer && !arguments.trim().starts_with('{') {
+                // ConfigOptionFloats(count, value), also used for nullable vectors.
+                let count = parse_number(parts[0], &parsed.constants)?;
+                if count != 1.0 {
+                    return Err(format!("unsupported repeated default for {key}: {arguments}"));
+                }
+                vec![parts[1]]
+            } else {
+                parts
+            };
+            let values = parts
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .map(|part| {
+                    if constructor.contains("Nullable") && part.trim().ends_with("::nil_value()") {
+                        return Ok(Value::Null);
+                    }
+                    if option.option_type == "coBools" {
+                        parse_bool(part, &parsed.constants).map(Value::Bool)
+                    } else if option.option_type == "coInts" {
+                        integer_value(parse_number(part, &parsed.constants)?)
+                    } else {
+                        number_value(parse_number(part, &parsed.constants)?)
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Value::Array(values))
+        }
+        "coPoint" | "coPoint3" | "coPoints" => {
+            let re =
+                regex::Regex::new(r"Vec[23]d\s*\(([^)]*)\)").map_err(|error| error.to_string())?;
+            let points = re
+                .captures_iter(&arguments)
+                .map(|captures| {
+                    let coordinates = split_top_level(&captures[1], ',')
+                        .into_iter()
+                        .map(|part| parse_number(part, &parsed.constants).map(|n| n.to_string()))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok(Value::String(coordinates.join("x")))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if option.option_type == "coPoints" {
+                Ok(Value::Array(points))
+            } else {
+                points.into_iter().next().ok_or_else(|| format!("point default missing for {key}"))
+            }
+        }
+        "coEnums" => {
+            let enum_pattern = regex::Regex::new(r"ConfigOptionEnum<([A-Za-z0-9_:]+)>")
+                .map_err(|error| error.to_string())?;
+            let enum_capture = enum_pattern
+                .captures(&option.block)
+                .ok_or_else(|| format!("enum vector metadata missing: {key}"))?;
+            let enum_type = &enum_capture[1];
+            let body = arguments.trim().trim_start_matches('{').trim_end_matches('}');
+            let parts = split_top_level(body, ',');
+            let parts =
+                if parts.len() == 2 && parts[0].trim() == "1" { vec![parts[1]] } else { parts };
+            let values = parts
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .map(|part| {
+                    let normalized = normalize_enum_value(part);
+                    parsed
+                        .enum_values
+                        .get(enum_type)
+                        .and_then(|values| values.get(&normalized))
+                        .cloned()
+                        .map(Value::String)
+                        .ok_or_else(|| format!("unknown enum vector default: {key}: {part}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Value::Array(values))
+        }
+        "coPointsGroups" | "coIntsGroups" if arguments.is_empty() => Ok(Value::Array(Vec::new())),
         "coFloatOrPercent" => {
             let parts = split_top_level(&arguments, ',');
             if parts.len() != 2 {
@@ -498,10 +710,21 @@ fn parse_enum_maps(source: &str) -> Result<BTreeMap<String, BTreeMap<String, Str
 fn normalize_enum_value(expression: &str) -> String {
     let mut value =
         expression.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    if let Some(inner) = value.strip_prefix("(int)") {
+        value = inner.into();
+    }
     while let Some(inner) = value.strip_prefix("int(").and_then(|value| value.strip_suffix(')')) {
         value = inner.into();
     }
-    value
+    value.rsplit("::").next().unwrap_or(&value).to_owned()
+}
+
+fn integer_value(number: f64) -> Result<Value, String> {
+    number
+        .to_string()
+        .parse::<i64>()
+        .map(|value| Value::Number(Number::from(value)))
+        .map_err(|_| format!("source integer is fractional or outside i64: {number}"))
 }
 
 fn parse_object_keys(source: &str) -> Result<HashSet<String>, String> {

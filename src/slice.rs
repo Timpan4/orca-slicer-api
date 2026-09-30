@@ -1,4 +1,5 @@
 use crate::{
+    calibration::Calibration,
     config::Config,
     contract::{Contract, ScopeValue, validate_bounds},
     error::AppError,
@@ -126,6 +127,7 @@ async fn slice_job(
     let mut supplied_request_id = None;
     let mut model_state = None;
     let mut process_overrides = None;
+    let mut calibration = None;
     while let Some(field) = mp.next_field().await.map_err(|e| AppError::Bad(e.to_string()))? {
         let name = field
             .name()
@@ -135,6 +137,12 @@ async fn slice_job(
             return Err(AppError::Bad("duplicate multipart field".into()));
         }
         match name.as_str() {
+            "calibration" => {
+                let bytes = field_bytes(field, MAX_PROFILE).await.map_err(AppError::Bad)?;
+                let request: Calibration = serde_json::from_slice(&bytes)?;
+                request.validate()?;
+                calibration = Some(request);
+            }
             "file" => {
                 if model.is_some() {
                     return Err(AppError::Bad("duplicate model field".into()));
@@ -219,6 +227,23 @@ async fn slice_job(
             }
             _ => return Err(AppError::Bad(format!("unknown multipart field: {name}"))),
         }
+    }
+    if let Some(request) = &calibration {
+        if model.is_some()
+            || model_state.is_some()
+            || process_overrides.is_some()
+            || plate.is_some_and(|value| value != 1)
+        {
+            return Err(AppError::Bad("calibration cannot be combined with a model, modelState, processOverrides, or another plate".into()));
+        }
+        if printer.is_none() || preset.is_none() || filaments.len() != 1 || schema_hash.is_none() {
+            return Err(AppError::Bad("calibration requires printerProfile, presetProfile, one filamentProfile, and schemaHash".into()));
+        }
+        let input = request
+            .prepare(dir, printer.as_deref().unwrap(), preset.as_deref().unwrap(), &filaments[0])
+            .await?;
+        model = Some(input);
+        arrange = true;
     }
     if model.is_none() {
         return Err(AppError::Bad("file is required".into()));
@@ -399,10 +424,12 @@ async fn execute_cli(
     tokio::fs::create_dir(&output_dir).await?;
     let progress_path = dir.join("progress.pipe");
     let (progress_reader, progress_writer) = create_progress_pipe(&progress_path).await?;
+    let calibration_path = dir.join("calibration.json");
+    let is_calibration = tokio::fs::try_exists(&calibration_path).await?;
     let mut cmd = Command::new(&s.config.cli_path);
     cmd.arg("--pipe").arg(&progress_path);
     cmd.arg("--slice").arg(plate.unwrap_or(1).to_string());
-    if arrange {
+    if arrange && !is_calibration {
         cmd.arg("--arrange").arg("1");
     }
     if export {
@@ -419,10 +446,14 @@ async fn execute_cli(
         cmd.arg("--load-filaments")
             .arg(filaments.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join(";"));
     }
+    if is_calibration {
+        cmd.arg("--load-assemble-list").arg(input);
+    } else {
+        cmd.arg(input);
+    }
     cmd.arg("--allow-newer-file")
         .arg("--outputdir")
         .arg(&output_dir)
-        .arg(input)
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -443,7 +474,7 @@ async fn execute_cli(
     let stdout_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
         BufReader::new(stdout).read_to_end(&mut bytes).await?;
-        Ok::<(), std::io::Error>(())
+        Ok::<Vec<u8>, std::io::Error>(bytes)
     });
     let stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
@@ -466,7 +497,7 @@ async fn execute_cli(
     drop(progress_writer);
     progress_task.abort();
     let _ = progress_task.await;
-    stdout_task
+    let stdout = stdout_task
         .await
         .map_err(|error| AppError::Execution(error.to_string()))?
         .map_err(|error| AppError::Execution(error.to_string()))?;
@@ -476,7 +507,8 @@ async fn execute_cli(
         .map_err(|error| AppError::Execution(error.to_string()))?;
     if !status.success() {
         return Err(AppError::Execution(format!(
-            "slicer exited unsuccessfully: {}",
+            "slicer exited unsuccessfully: {} {}",
+            String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         )));
     }
@@ -493,7 +525,12 @@ async fn execute_cli(
         }
     }
     let output = found.ok_or_else(|| AppError::Execution("slicer produced no output".into()))?;
-    let bytes = tokio::fs::read(&output).await?;
+    let mut bytes = tokio::fs::read(&output).await?;
+    if is_calibration {
+        let request: Calibration =
+            serde_json::from_slice(&tokio::fs::read(&calibration_path).await?)?;
+        bytes = crate::calibration::finish_artifact(bytes, export, dir, &request).await?;
+    }
     let output_metadata = metadata::from_artifact(
         &bytes,
         output.extension().and_then(|extension| extension.to_str()),
