@@ -53,6 +53,8 @@ RUN cargo build --release --locked \
        --print-config-header /tmp/orca-slicer/src/libslic3r/PrintConfig.hpp \
        --constants-source /tmp/orca-slicer/src/libslic3r/PrintConfigConstants.hpp \
        --tab-source /tmp/orca-slicer/src/slic3r/GUI/Tab.cpp \
+       --preset-source /tmp/orca-slicer/src/libslic3r/Preset.cpp \
+       --profile-schema-dir /tmp \
        --output /tmp/process-schema-first.json \
     && ./target/release/schema-export \
        --print-config-source /tmp/orca-slicer/src/libslic3r/PrintConfig.cpp \
@@ -89,6 +91,8 @@ COPY --from=orca-runtime /opt/squashfs-root/ /app/orca/
 COPY --from=orca-source /opt/orca-slicer/LICENSE.txt /app/ORCASLICER-LICENSE.txt
 COPY --from=rust-builder /src/target/release/orca-slicer-api /app/bin/orca-slicer-api
 COPY --from=rust-builder /tmp/process-schema.json /app/schema/process.json
+COPY --from=rust-builder /tmp/printer.json /app/schema/printer.json
+COPY --from=rust-builder /tmp/filament.json /app/schema/filament.json
 COPY --from=rust-builder /tmp/profiles.json /app/schema/profiles.json
 COPY NOTICE THIRD_PARTY.md LICENSE /app/
 RUN /app/orca/AppRun --help 2>&1 | grep -q '^OrcaSlicer-2.4.2:'

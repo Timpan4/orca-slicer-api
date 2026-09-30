@@ -52,6 +52,29 @@ fn run() -> Result<(), String> {
     };
     contract.schema_hash = process_hash(&contract).map_err(|error| error.to_string())?;
     schema::validate(&contract)?;
+    if let Some(preset_path) = argument(&args, "--preset-source") {
+        let preset = fs::read_to_string(preset_path).map_err(|error| error.to_string())?;
+        let directory =
+            argument(&args, "--profile-schema-dir").ok_or("--profile-schema-dir required")?;
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        for kind in ["printer", "filament"] {
+            let schema = schema::build_profile_schema(
+                OrcaSources {
+                    print_config: &print_config,
+                    print_config_header: &print_config_header,
+                    constants: &constants,
+                },
+                &preset,
+                kind,
+            )?;
+            let value = serde_json::to_value(schema).map_err(|error| error.to_string())?;
+            fs::write(
+                directory.join(format!("{kind}.json")),
+                compact_json(&value).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
     let value = serde_json::to_value(contract).map_err(|error| error.to_string())?;
     fs::write(output, compact_json(&value).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())

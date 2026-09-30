@@ -202,6 +202,57 @@ fn multipart(parts: &[(&str, Option<&str>, &str)]) -> (String, Vec<u8>) {
 }
 
 #[tokio::test]
+async fn calibration_requires_a_complete_profile_set_before_running_orca() {
+    let root = test_dir("calibration-unavailable");
+    let (content_type, body) = multipart(&[(
+        "calibration",
+        None,
+        r#"{"step":"temperature","lowest":200,"highest":220,"increment":5,"baseline":210}"#,
+    )]);
+    let response = api::router(state(&root))
+        .oneshot(
+            Request::post("/slice")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!root.join("args.txt").exists());
+}
+
+#[tokio::test]
+async fn temperature_calibration_rejects_fractional_degrees() {
+    let root = test_dir("calibration-temperature-labels");
+    let app = api::router(state(&root));
+    for values in [(200.5, 220.0, 5.0), (200.0, 220.5, 5.0), (200.0, 220.0, 0.5)] {
+        let calibration = json!({"step":"temperature", "lowest":values.0,
+            "highest":values.1, "increment":values.2, "baseline":210})
+        .to_string();
+        let (content_type, body) = multipart(&[("calibration", None, &calibration)]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/slice")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let error: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error["details"].as_str().unwrap().contains("whole degrees"), "{error}");
+    }
+    assert!(!root.join("args.txt").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn slice_materializes_trusted_profile_stubs_and_rejects_unknown_names() {
     let root = test_dir("profile-stubs");
     let profile_root = root.join("profiles");

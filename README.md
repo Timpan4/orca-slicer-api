@@ -12,6 +12,8 @@ Service listens on port `3000`.
 - `GET /source`
 - `GET /capabilities`
 - `GET /schema/process`
+- `GET /schema/printer`
+- `GET /schema/filament`
 - `GET /profiles/bundled`
 - `POST /slice`
 - `GET /slice/progress/{request_id}`
@@ -22,9 +24,21 @@ Each slice gets a private Orca `--pipe` FIFO under `/app/data/jobs`. JSON events
 
 Capability flags are evidence gates. No synthetic schema, model, progress, metadata, or slice artifact is returned.
 
+## Guided calibration engine
+
+The Rust shim generates geometry and profile settings, then slices them with the existing checksum-pinned Orca AppImage. It never builds Orca from source. The release gate inspects all five real Bambu 3MF and Klipper G-code artifacts without sending a printer command.
+
+`GET /capabilities` reports `calibration.available`, version `1`, and supported steps. Calibration uses the normal `ORCA_CLI_PATH` and trusted bundled profiles. No separate calibration binary or resources directory is required.
+
+Calibration `POST /slice` replaces `file` with a JSON `calibration` field containing `step`, `lowest`, `highest`, `increment`, `baseline`, and `previous_results`. It requires printer/process/one filament profile and the matching `schemaHash`. Steps are `temperature`, `flow_rate`, `pressure_advance`, `retraction`, and `volumetric_flow`. `previous_results` contains preceding confirmed values. Model uploads, `modelState`, `processOverrides`, and other plates cannot be combined with calibration. The step size must reach the highest test value. Temperature requires whole degrees and cannot exceed the filament profile's maximum temperature.
+
+Temperature runs hottest at the bottom, with section height `25 × nozzle diameter` mm. Flow tiles carry sample numbers starting at 1. Pressure advance and volumetric flow use 1 mm bands from the base. Retraction uses 1 mm bands above a 0.4 mm base. Retraction processing changes only recognized paired relative-E moves inside the generated model, preserving startup/shutdown and deposition moves. Unsupported custom extrusion fails closed. Bambu 3MF plate checksums are recomputed after rewriting. Native time/filament metadata remains the estimate from slicing at the maximum retraction distance.
+
+Artifact checks prove file generation and value changes, not physical calibration quality. The user must print, inspect, and choose each result. The sidecar does not infer a result from a photo.
+
 ## Schema extraction
 
-Rust reads the pinned Orca source files listed above without initializing GUI runtime, recovers process page, group, and option order, validates registry metadata and scopes, and hashes canonical compact JSON. `tests/pinned_source.rs` is the extraction oracle: against a fresh sparse checkout it requires 6 pages, 41 groups, 342 complete unique options, and byte-identical repeated extraction.
+Rust reads the pinned Orca source files listed above without initializing GUI runtime, recovers process page, group, and option order, validates registry metadata and scopes, and hashes canonical compact JSON. `Preset.cpp` supplies printer and filament key lists, including motion axes and filament overrides. Vector metadata includes item types, defaults, bounds, choices, units, and nullable values. `tests/pinned_source.rs` checks the pinned source's 342 process, 160 printer, and 126 filament options and deterministic repeated extraction. Each schema response has its own content hash and the same engine/image identity.
 
 ## Development
 

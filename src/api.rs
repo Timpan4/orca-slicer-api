@@ -1,7 +1,8 @@
+use crate::error::AppError;
 use crate::slice::{AppState, progress, slice};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -14,6 +15,7 @@ pub fn router(state: AppState) -> Router {
         .route("/source", get(source))
         .route("/capabilities", get(capabilities))
         .route("/schema/process", get(schema))
+        .route("/schema/{kind}", get(profile_schema))
         .route("/profiles/bundled", get(profiles))
         .route("/slice", post(slice).layer(DefaultBodyLimit::max(MAX_MULTIPART_BYTES)))
         .route("/slice/progress/{request_id}", get(progress))
@@ -47,6 +49,11 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
         "schema_hash": contract.schema_hash,
         "capabilities": contract.capabilities,
         "supported_scopes": contract.supported_scopes,
+        "calibration": {
+            "available": true,
+            "version": "1",
+            "steps": ["temperature", "flow_rate", "pressure_advance", "retraction", "volumetric_flow"],
+        },
     }))
 }
 
@@ -69,4 +76,34 @@ async fn schema(State(state): State<AppState>) -> Json<Value> {
 
 async fn profiles(State(state): State<AppState>) -> Json<Value> {
     Json((*state.profiles).clone())
+}
+
+async fn profile_schema(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    if !matches!(kind.as_str(), "printer" | "filament") {
+        return Err(AppError::Bad("schema kind must be printer or filament".into()));
+    }
+    let path =
+        state.config.schema_path.parent().ok_or(AppError::Internal)?.join(format!("{kind}.json"));
+    let bytes = tokio::fs::read(path).await.map_err(|_| {
+        AppError::Unavailable("profile schema is not packaged in this image".into())
+    })?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    crate::contract::validate_bounds(&value).map_err(AppError::Bad)?;
+    let schema: crate::contract::ProcessSchema = serde_json::from_value(value)?;
+    let hash = crate::contract::sha256_json(&serde_json::to_value(&schema)?)
+        .map_err(|_| AppError::Internal)?;
+    let contract = &state.contract;
+    Ok(Json(json!({
+        "contract_version": contract.contract_version,
+        "engine": contract.engine,
+        "image_identity": contract.image_identity,
+        "schema_hash": hash,
+        "capabilities": contract.capabilities,
+        "supported_scopes": ["global"],
+        "pages": schema.pages, "options":schema.options,
+        "scopes":schema.scopes, "samples":schema.samples,
+    })))
 }
