@@ -55,3 +55,36 @@ fn klipper_layer_markers_identify_retraction_bands() {
     assert!(output.contains("G1 E-0.2\nG1 E0.2"));
     assert!(output.contains("G1 E-0.4\nG1 E0.4"));
 }
+
+// Failure mode: a profile printing at 265 °C under a parent's 220-260 °C recommended range
+// could not be calibrated, though OrcaSlicer's own temperature tower allows it.
+#[tokio::test]
+async fn temperature_tower_may_exceed_the_filament_recommended_range() {
+    let dir = std::env::temp_dir().join(format!("calibration-range-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, value: serde_json::Value| {
+        let path = dir.join(name);
+        std::fs::write(&path, value.to_string()).unwrap();
+        path
+    };
+    let printer = write(
+        "printer.json",
+        serde_json::json!({"nozzle_diameter":["0.4"],"gcode_flavor":"klipper","printable_height":"250"}),
+    );
+    let process = write("process.json", serde_json::json!({}));
+    let filament =
+        write("filament.json", serde_json::json!({"nozzle_temperature_range_high":["260"]}));
+    let tower = |lowest: f64, highest: f64, baseline: f64| Calibration {
+        step: CalibrationStep::Temperature,
+        lowest,
+        highest,
+        increment: 5.0,
+        baseline,
+        previous_results: Default::default(),
+    };
+    tower(240.0, 270.0, 265.0).prepare(&dir, &printer, &process, &filament).await.unwrap();
+    let error =
+        tower(340.0, 355.0, 345.0).prepare(&dir, &printer, &process, &filament).await.unwrap_err();
+    assert!(error.to_string().contains("350"), "{error}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
