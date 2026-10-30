@@ -89,3 +89,46 @@ async fn temperature_tower_may_exceed_the_filament_recommended_range() {
     assert!(error.to_string().contains("500"), "{error}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// Failure mode: a first layer line width of "160%" made the pinned Orca CLI's arrange read a
+// 160 mm skirt (get_real_skirt_dist uses the raw number), shrink the bed to nothing, and exit -21.
+#[tokio::test]
+async fn percentage_line_widths_become_millimetres_of_the_nozzle() {
+    let dir = std::env::temp_dir().join(format!("calibration-widths-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, value: serde_json::Value| {
+        let path = dir.join(name);
+        std::fs::write(&path, value.to_string()).unwrap();
+        path
+    };
+    let printer = write(
+        "printer.json",
+        serde_json::json!({"nozzle_diameter":["0.4"],"gcode_flavor":"klipper","printable_height":"250"}),
+    );
+    let process = write(
+        "process.json",
+        serde_json::json!({"initial_layer_line_width":" 160 %","line_width":["110%"],"inner_wall_line_width":"0.45"}),
+    );
+    let filament = write("filament.json", serde_json::json!({}));
+    let tower = Calibration {
+        step: CalibrationStep::Temperature,
+        lowest: 240.0,
+        highest: 270.0,
+        increment: 5.0,
+        baseline: 265.0,
+        previous_results: Default::default(),
+    };
+    tower.prepare(&dir, &printer, &process, &filament).await.unwrap();
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&process).unwrap()).unwrap();
+    assert_eq!(prepared["initial_layer_line_width"], "0.64");
+    assert_eq!(prepared["line_width"], serde_json::json!(["0.44"]));
+    assert_eq!(prepared["inner_wall_line_width"], "0.45");
+    // A profile that leaves a width to its parent keeps leaving it.
+    let process = write("process.json", serde_json::json!({}));
+    tower.prepare(&dir, &printer, &process, &filament).await.unwrap();
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&process).unwrap()).unwrap();
+    assert!(prepared.get("line_width").is_none(), "{prepared}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
