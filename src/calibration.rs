@@ -20,14 +20,38 @@ pub enum CalibrationStep {
 #[serde(deny_unknown_fields)]
 pub struct Calibration {
     pub step: CalibrationStep,
+    #[serde(default = "missing", skip_serializing_if = "is_missing")]
     pub lowest: f64,
+    #[serde(default = "missing", skip_serializing_if = "is_missing")]
     pub highest: f64,
+    #[serde(default = "missing", skip_serializing_if = "is_missing")]
     pub increment: f64,
+    #[serde(default, deserialize_with = "flow_pattern", skip_serializing_if = "Option::is_none")]
+    pub flow_pattern: Option<FlowPattern>,
     pub baseline: f64,
     #[serde(default)]
     pub previous_results: std::collections::BTreeMap<CalibrationStep, f64>,
 }
 
+fn missing() -> f64 {
+    f64::NAN
+}
+fn flow_pattern<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<FlowPattern>, D::Error> {
+    FlowPattern::deserialize(deserializer).map(Some)
+}
+fn is_missing(v: &f64) -> bool {
+    v.is_nan()
+}
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowPattern {
+    Yolo,
+    YoloPerfectionist,
+    Pass1,
+    Pass2,
+}
 impl Calibration {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.previous_results.iter().any(|(step, value)| {
@@ -42,6 +66,31 @@ impl Calibration {
                 || (matches!(step, CalibrationStep::Temperature) && value.fract() != 0.0)
         }) {
             return Err(AppError::Bad("invalid preceding calibration results".into()));
+        }
+        if self.step == CalibrationStep::FlowRate {
+            if self.flow_pattern.is_none()
+                || ![self.lowest, self.highest, self.increment].iter().all(|v| v.is_nan())
+                || !self.baseline.is_finite()
+                || self.baseline <= 0.0
+                || self.baseline > 2.0
+            {
+                return Err(AppError::Bad("flow_rate requires flow_pattern and positive baseline at most 2; range fields are forbidden".into()));
+            }
+            return Ok(());
+        }
+        if self.flow_pattern.is_some() {
+            return Err(AppError::Bad("flow_pattern is only valid for flow_rate".into()));
+        }
+        if self.step == CalibrationStep::Temperature
+            && (self.increment != 5.0
+                || self.lowest < 5.0
+                || self.highest > 350.0
+                || self.lowest % 5.0 != 0.0
+                || self.highest % 5.0 != 0.0)
+        {
+            return Err(AppError::Bad(
+                "temperature requires whole degrees, increment 5 and bounds in 5..350, multiples of 5".into(),
+            ));
         }
         if ![self.lowest, self.highest, self.increment, self.baseline]
             .iter()
@@ -77,6 +126,9 @@ impl Calibration {
 
     pub fn values(&self) -> Result<Vec<f64>, AppError> {
         self.validate()?;
+        if self.step == CalibrationStep::FlowRate {
+            return Ok(Vec::new());
+        }
         let intervals = ((self.highest - self.lowest) / self.increment).ceil();
         // Generated objects/ranges use the existing model-state and JSON entry contracts.
         let maximum = if self.step == CalibrationStep::FlowRate { 256.0 } else { 4096.0 };
@@ -105,10 +157,33 @@ impl Calibration {
         process_path: &Path,
         filament_path: &Path,
     ) -> Result<PathBuf, AppError> {
-        let values = self.values()?;
+        self.prepare_with_cli(
+            dir,
+            printer_path,
+            process_path,
+            filament_path,
+            &crate::config::cli_path(),
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_with_cli(
+        &self,
+        dir: &Path,
+        printer_path: &Path,
+        process_path: &Path,
+        filament_path: &Path,
+        cli: &str,
+    ) -> Result<PathBuf, AppError> {
+        self.values()?;
         let mut printer: Value = serde_json::from_slice(&tokio::fs::read(printer_path).await?)?;
         let mut process: Value = serde_json::from_slice(&tokio::fs::read(process_path).await?)?;
         let mut filament: Value = serde_json::from_slice(&tokio::fs::read(filament_path).await?)?;
+        let volumetric_span = if self.step == CalibrationStep::VolumetricFlow {
+            Some(volumetric_bed_span(&printer)?)
+        } else {
+            None
+        };
         let temperature = if self.step == CalibrationStep::Temperature {
             self.highest.max(self.baseline)
         } else {
@@ -137,7 +212,12 @@ impl Calibration {
             }
         }
         let nozzle = profile_number(&printer, "nozzle_diameter")?;
-        let layer_height = nozzle / 2.0;
+        let layer_height = match self.step {
+            CalibrationStep::Retraction => 0.2,
+            CalibrationStep::VolumetricFlow => nozzle * 0.8,
+            CalibrationStep::FlowRate => nozzle / 2.0,
+            _ => profile_number(&process, "layer_height")?,
+        };
         let flavor = printer["gcode_flavor"]
             .as_str()
             .ok_or_else(|| AppError::Bad("printer gcode_flavor is required".into()))?
@@ -186,151 +266,286 @@ impl Calibration {
             }
         }
         set(&mut process, "layer_height", layer_height);
-        set(&mut process, "initial_layer_print_height", layer_height);
+        if self.step == CalibrationStep::Retraction {
+            set(&mut process, "initial_layer_print_height", layer_height);
+        }
         set(&mut process, "alternate_extra_wall", false);
         set(&mut process, "seam_slope_type", "none");
         set(&mut process, "enable_wrapping_detection", false);
         set(&mut process, "max_volumetric_extrusion_rate_slope", 0);
-        set(&mut process, "brim_type", "outer_only");
-        set(&mut process, "brim_object_gap", 0);
         set(&mut process, "enable_support", false);
         set(&mut process, "ironing_type", "no ironing");
         set(&mut process, "print_sequence", "by layer");
         set(&mut printer, "resonance_avoidance", false);
-        let band =
-            if self.step == CalibrationStep::Temperature { 10.0 * nozzle / 0.4 } else { 1.0 };
-        let base = if self.step == CalibrationStep::Retraction { 0.4 } else { 0.0 };
-        let height = base + values.len() as f64 * band;
-        if self.step != CalibrationStep::FlowRate
-            && height > profile_number(&printer, "printable_height")?
-        {
+        let height = match self.step {
+            CalibrationStep::Temperature => ((self.highest - self.lowest) / 5.0 + 1.0) * 10.0,
+            CalibrationStep::PressureAdvance => {
+                ((self.highest - self.lowest) / self.increment).ceil() + 1.0
+            }
+            CalibrationStep::Retraction => 1.4 + (self.highest - self.lowest) / self.increment,
+            CalibrationStep::VolumetricFlow => (self.highest - self.lowest + 1.0) / self.increment,
+            CalibrationStep::FlowRate => layer_height * 10.0,
+        };
+        if height > profile_number(&printer, "printable_height")? {
             return Err(AppError::Bad(
                 "calibration tower exceeds the printer's printable height".into(),
+            ));
+        }
+        if self.step == CalibrationStep::PressureAdvance
+            && self.lowest + height.floor() * self.increment > 2.0
+        {
+            return Err(AppError::Bad(
+                "per-height pressure advance exceeds the pinned Orca maximum of 2".into(),
             ));
         }
         let mut objects = Vec::new();
         let mut layer_code = String::new();
         if self.step == CalibrationStep::FlowRate {
-            set(&mut process, "wall_loops", 1);
-            set(&mut process, "top_shell_layers", 5);
-            set(&mut process, "bottom_shell_layers", 2);
-            set(&mut process, "sparse_infill_density", "35%");
-            set(&mut process, "top_surface_pattern", "monotonic");
-            set(&mut process, "top_surface_line_width", nozzle * 1.2);
-            for (i, value) in values.iter().enumerate() {
-                let path = dir.join(format!("sample_{}_{}.stl", i + 1, value));
-                let mut mesh = String::from("solid calibration\n");
-                cuboid(&mut mesh, [0.0, 0.0, 0.0], [20.0, 25.0, layer_height * 10.0]);
-                // A numbered tab identifies each tile independently of auto-arrangement.
-                digits(&mut mesh, &(i + 1).to_string(), layer_height * 10.0);
-                mesh.push_str("endsolid calibration\n");
-                tokio::fs::write(&path, mesh).await?;
-                objects.push(json!({"path":path,"count":1,"filaments":[1],"print_params":{"print_flow_ratio":(value / self.baseline).to_string()}}));
+            let pattern = self.flow_pattern.ok_or(AppError::Internal)?;
+            let (file, linear, pass2) = match pattern {
+                FlowPattern::Yolo => ("Orca-LinearFlow.3mf", true, false),
+                FlowPattern::YoloPerfectionist => ("Orca-LinearFlow_fine.3mf", true, true),
+                FlowPattern::Pass1 => ("flowrate-test-pass1.3mf", false, false),
+                FlowPattern::Pass2 => ("flowrate-test-pass2.3mf", false, true),
+            };
+            let root = std::env::var("ORCA_CALIBRATION_PATH")
+                .unwrap_or_else(|_| "/app/orca/resources/calib".into());
+            let first = profile_number(&process, "initial_layer_print_height")?.max(layer_height);
+            set(&mut process, "initial_layer_print_height", first);
+            set(&mut process, "reduce_crossing_wall", true);
+            let flow_area =
+                layer_height * (nozzle * 1.2 - layer_height * (1.0 - std::f64::consts::PI / 4.0));
+            let factor = if linear {
+                (self.baseline + if pass2 { 0.035 } else { 0.05 }) / self.baseline
+            } else if pass2 {
+                1.0
+            } else {
+                1.2
+            };
+            let maximum =
+                profile_number(&filament, "filament_max_volumetric_speed")? / (flow_area * factor);
+            let solid =
+                profile_number(&process, "internal_solid_infill_speed")?.min(maximum).floor();
+            let top = profile_number(&process, "top_surface_speed")?.min(maximum).floor();
+            let models = crate::calibration_mesh::flow_models(
+                &Path::new(&root).join("filament_flow").join(file),
+            )?;
+            let bed = bed_bounds(&printer)?;
+            let xy = if nozzle / 0.6 > 1.2 { nozzle / 0.6 } else { 1.0 };
+            let mut low = [f64::INFINITY; 2];
+            let mut high = [f64::NEG_INFINITY; 2];
+            for (_, mesh) in &models {
+                let (a, b) = mesh.bounds();
+                for i in 0..2 {
+                    low[i] = low[i].min(a[i] * xy);
+                    high[i] = high[i].max(b[i] * xy);
+                }
+            }
+            let shift =
+                std::array::from_fn::<_, 2, _>(|i| (bed.0[i] + bed.1[i] - low[i] - high[i]) / 2.0);
+            for i in 0..2 {
+                if high[i] - low[i] > bed.1[i] - bed.0[i] {
+                    return Err(AppError::Bad("Orca flow pattern exceeds printable area".into()));
+                }
+            }
+            for (name, mut mesh) in models {
+                let modifier = name
+                    .strip_prefix("flowrate_")
+                    .ok_or(AppError::Internal)?
+                    .replacen('m', "-", 1)
+                    .parse::<f64>()
+                    .map_err(|_| AppError::Internal)?;
+                let ratio = if linear {
+                    (self.baseline + modifier) / self.baseline
+                } else {
+                    1.0 + modifier / 100.0
+                };
+                if ratio <= 0.0 || self.baseline * ratio > 2.0 {
+                    return Err(AppError::Bad(
+                        "flow sample exceeds the pinned Orca flow maximum of 2".into(),
+                    ));
+                }
+                mesh.scale([xy, xy, (first + 9.0 * layer_height) / 2.0]);
+                for p in mesh.0.iter_mut().flatten() {
+                    for i in 0..2 {
+                        p[i] += shift[i];
+                    }
+                }
+                mesh.on_bed();
+                if mesh.bounds().1[2] > profile_number(&printer, "printable_height")? {
+                    return Err(AppError::Bad("flow model exceeds printable height".into()));
+                }
+                let path = dir.join(format!("{name}.stl"));
+                mesh.write(&path).await?;
+                let params = json!({
+                    "wall_loops":"1","only_one_wall_top":"1","thick_internal_bridges":"0","enable_extra_bridge_layer":"disabled",
+                    "internal_bridge_density":"100%","sparse_infill_density":"35%","min_width_top_surface":"100%",
+                    "bottom_shell_layers":"2","top_shell_layers":"5","top_shell_thickness":"0","bottom_shell_thickness":"0",
+                    "detect_thin_wall":"1","filter_out_gap_fill":"0","sparse_infill_pattern":"rectilinear",
+                    "top_surface_line_width":(nozzle*1.2).to_string(),"internal_solid_infill_line_width":(nozzle*1.2).to_string(),
+                    "top_surface_pattern":"monotonic","top_solid_infill_flow_ratio":"1","infill_direction":"45","solid_infill_direction":"135",
+                    "rotate_solid_infill_direction":"1","ironing_type":"no ironing","internal_solid_infill_speed":solid.to_string(),
+                    "top_surface_speed":top.to_string(),"seam_slope_type":"none","print_flow_ratio":ratio.to_string()
+                });
+                objects.push(json!({"path":path,"count":1,"filaments":[1],"print_params":params}));
             }
         } else {
-            let path = dir.join("calibration.stl");
-            let mut mesh = String::from("solid calibration\n");
-            match self.step {
-                CalibrationStep::Temperature => {
-                    for i in 0..values.len() {
-                        let z = i as f64 * band;
-                        cuboid(&mut mesh, [0.0, 0.0, z], [5.0, 15.0, band]);
-                        cuboid(&mut mesh, [25.0, 0.0, z], [5.0, 15.0, band]);
-                        cuboid(
-                            &mut mesh,
-                            [5.0, 0.0, z + band - layer_height * 3.0],
-                            [20.0, 15.0, layer_height * 3.0],
-                        );
+            let resource = match self.step {
+                CalibrationStep::Temperature => "temperature_tower/temperature_tower.drc",
+                CalibrationStep::PressureAdvance => "pressure_advance/tower_with_seam.drc",
+                CalibrationStep::Retraction => "retraction/retraction_tower.drc",
+                CalibrationStep::VolumetricFlow => "volumetric_speed/SpeedTestStructure.drc",
+                CalibrationStep::FlowRate => unreachable!(),
+            };
+            let mut mesh = crate::calibration_mesh::Mesh::tower(dir, resource, cli).await?;
+            mesh.on_bed();
+            if self.step == CalibrationStep::Temperature {
+                let bottom = (350.0 - self.highest) / 5.0 * 10.0;
+                // Plater::calib_temp uses libslic3r's EPSILON (1e-4 mm).
+                mesh.cut(bottom + height + 1e-4, true)?;
+                if bottom > 0.0 {
+                    mesh.cut(bottom + 1e-4, false)?;
+                }
+                mesh.on_bed();
+                set_result(&mut filament, CalibrationStep::Temperature, self.highest);
+                set(&mut process, "brim_type", "outer_only");
+                set(&mut process, "brim_object_gap", 0);
+                set(&mut process, "brim_width", 5.0);
+            } else {
+                if height > mesh.bounds().1[2] {
+                    return Err(AppError::Bad(
+                        "requested height exceeds Orca calibration model".into(),
+                    ));
+                }
+                mesh.cut(height, true)?;
+                set(&mut process, "top_shell_layers", 0);
+                set(&mut process, "sparse_infill_density", "0%");
+                match self.step {
+                    CalibrationStep::PressureAdvance => {
+                        let configured = profile_nonnegative_number(&process, "line_width")?;
+                        let width = if configured == 0.0 { nozzle * 1.125 } else { configured };
+                        let area = layer_height
+                            * (width - layer_height * (1.0 - std::f64::consts::PI / 4.0));
+                        // calib.cpp's suggested minimum is 100 mm/s.
+                        let speed = profile_number(&process, "outer_wall_speed")?
+                            .max(100.0)
+                            .min(profile_number(&filament, "filament_max_volumetric_speed")? / area)
+                            .floor();
+                        set(&mut process, "outer_wall_speed", speed);
+                        set(&mut process, "inner_wall_speed", speed);
+                        set(&mut process, "wall_loops", 2);
+                        set(&mut process, "bottom_shell_layers", 0);
+                        set(&mut process, "seam_position", "back");
+                        set(&mut process, "brim_type", "brim_ears");
+                        set(&mut process, "brim_object_gap", 0);
+                        set(&mut process, "brim_ears_max_angle", 135);
+                        set(&mut process, "brim_width", 6);
+                        set(&mut filament, "adaptive_pressure_advance", json!(["0"]));
+                        set(&mut filament, "slow_down_layer_time", json!(["1"]));
                     }
-                    set(
-                        &mut filament,
-                        "nozzle_temperature",
-                        json!([values.last().unwrap().to_string()]),
-                    );
-                    set(
-                        &mut filament,
-                        "nozzle_temperature_initial_layer",
-                        json!([values.last().unwrap().to_string()]),
-                    );
+                    CalibrationStep::Retraction => {
+                        let max_height = profile_nonnegative_number(&printer, "max_layer_height")?
+                            .max(layer_height);
+                        set(&mut printer, "max_layer_height", json!([max_height.to_string()]));
+                        set(&mut process, "wall_loops", 2);
+                        set(&mut process, "bottom_shell_layers", 3);
+                        set(&mut printer, "use_relative_e_distances", true);
+                        set(&mut printer, "use_firmware_retraction", false);
+                        set(
+                            &mut filament,
+                            "filament_retraction_length",
+                            json!([self.highest.to_string()]),
+                        );
+                        for key in [
+                            "filament_wipe",
+                            "filament_retract_restart_extra",
+                            "filament_retraction_minimum_travel",
+                        ] {
+                            set(&mut filament, key, json!(["0"]));
+                        }
+                        set(&mut process, "reduce_crossing_wall", false);
+                    }
+                    CalibrationStep::VolumetricFlow => {
+                        set(&mut printer, "use_relative_e_distances", true);
+                        let span = volumetric_span.ok_or(AppError::Internal)?;
+                        let (lo, hi) = mesh.bounds();
+                        mesh.scale([((span - 10.0) / (hi[0] - lo[0])).min(1.0), 1.0, 1.0]);
+                        let max_height = profile_nonnegative_number(&printer, "max_layer_height")?
+                            .max(layer_height);
+                        set(&mut printer, "max_layer_height", json!([max_height.to_string()]));
+                        set(&mut filament, "filament_max_volumetric_speed", json!(["200"]));
+                        set(&mut filament, "slow_down_layer_time", json!(["0"]));
+                        set(&mut process, "wall_loops", 1);
+                        set(&mut process, "bottom_shell_layers", 0);
+                        set(&mut process, "outer_wall_line_width", nozzle * 1.75);
+                        set(&mut process, "enable_overhang_speed", false);
+                        set(&mut process, "overhang_reverse", false);
+                        set(&mut process, "brim_type", "outer_and_inner");
+                        set(&mut process, "brim_object_gap", 0);
+                        set(&mut process, "brim_width", 5);
+                        set(&mut process, "timelapse_type", "0");
+                        set(&mut process, "spiral_mode", true);
+                    }
+                    _ => {}
+                }
+            }
+            let name = Path::new(resource).file_stem().ok_or(AppError::Internal)?.to_string_lossy();
+            let path = dir.join(format!("{name}.stl"));
+            mesh.write(&path).await?;
+            // CLI lacks set_calib_params. These expressions mirror GCode.cpp at the pinned commit.
+            let expression = match self.step {
+                CalibrationStep::Temperature => format!(
+                    "int(({} + 5 - layer_num / (total_layer_count - 1.0) * ({} - {} + 5)) / 5) * 5",
+                    self.highest, self.highest, self.lowest
+                ),
+                CalibrationStep::PressureAdvance => {
+                    format!("{} + int(layer_z) * {}", self.lowest, self.increment)
                 }
                 CalibrationStep::Retraction => {
-                    cuboid(&mut mesh, [0.0, 0.0, 0.0], [35.0, 10.0, base]);
-                    cuboid(&mut mesh, [0.0, 0.0, base], [5.0, 10.0, height - base]);
-                    cuboid(&mut mesh, [30.0, 0.0, base], [5.0, 10.0, height - base]);
-                    // Force paired relative-E retracts so the shim can vary only these pairs.
-                    set(&mut printer, "use_relative_e_distances", true);
-                    set(&mut printer, "use_firmware_retraction", false);
-                    set(
-                        &mut filament,
-                        "filament_retraction_length",
-                        json!([self.highest.to_string()]),
-                    );
-                    set(&mut filament, "filament_wipe", json!(["0"]));
-                    set(&mut filament, "filament_retract_restart_extra", json!(["0"]));
-                    set(&mut filament, "filament_retraction_minimum_travel", json!(["0"]));
-                    set(&mut process, "reduce_crossing_wall", false);
-                }
-                CalibrationStep::PressureAdvance => {
-                    cuboid(&mut mesh, [0.0, 0.0, 0.0], [30.0, 30.0, height]);
-                    set(&mut process, "seam_position", "back");
-                    set(&mut filament, "adaptive_pressure_advance", json!(["0"]));
-                    set(&mut filament, "slow_down_layer_time", json!(["0"]));
+                    format!("{} + int(max(0, layer_z - 0.4)) * {}", self.lowest, self.increment)
                 }
                 CalibrationStep::VolumetricFlow => {
-                    cuboid(&mut mesh, [0.0, 0.0, 0.0], [100.0, 20.0, height]);
-                    set(&mut process, "wall_loops", 1);
-                    set(&mut process, "outer_wall_line_width", nozzle * 1.75);
-                    set(
-                        &mut filament,
-                        "filament_max_volumetric_speed",
-                        json!([self.highest.to_string()]),
-                    );
-                    set(&mut filament, "slow_down_layer_time", json!(["0"]));
-                    set(&mut process, "enable_overhang_speed", false);
+                    format!("{} + layer_z * {}", self.lowest, self.increment)
                 }
-                CalibrationStep::FlowRate => unreachable!(),
-            }
-            mesh.push_str("endsolid calibration\n");
-            tokio::fs::write(&path, mesh).await?;
-            if self.step != CalibrationStep::Temperature {
-                set(&mut process, "top_shell_layers", 0);
-                set(&mut process, "bottom_shell_layers", 2);
-                set(&mut process, "sparse_infill_density", "0%");
-            }
-            let mut ranges = Vec::new();
-            for (i, value) in values.iter().enumerate() {
-                let low = if i == 0 { 0.0 } else { base + i as f64 * band };
-                let high = base + (i + 1) as f64 * band;
-                let actual = if self.step == CalibrationStep::Temperature {
-                    values[values.len() - 1 - i]
-                } else {
-                    *value
-                };
-                let command = match self.step {
-                    CalibrationStep::Temperature => format!("M104 S{actual}"),
-                    CalibrationStep::PressureAdvance => pressure_command(&flavor, actual),
-                    _ => String::new(),
-                };
-                writeln!(&mut layer_code, "{{if layer_z >= {low} and layer_z < {high}}}\n;LAYERCOVE_CALIBRATION {:?} {actual} Z={{layer_z}}\n{command}\n{{endif}}", self.step).unwrap();
-                if self.step == CalibrationStep::VolumetricFlow {
-                    let width = nozzle * 1.75;
-                    // Orca Flow::mm3_per_mm, rounded-rectangle bead cross section.
-                    let area =
-                        layer_height * (width - layer_height * (1.0 - std::f64::consts::PI / 4.0));
-                    let flow = profile_number(&filament, "filament_flow_ratio")?;
-                    let speed = actual / (area * flow);
-                    if speed
-                        > profile_number(&printer, "machine_max_speed_x")?
-                            .min(profile_number(&printer, "machine_max_speed_y")?)
-                    {
-                        return Err(AppError::Bad(
-                            "volumetric test exceeds the printer profile's XY speed limit".into(),
-                        ));
-                    }
-                    ranges.push(json!({"min_z":low,"max_z":high,"range_params":{"layer_height":layer_height.to_string(),"outer_wall_speed":speed.to_string(),"inner_wall_speed":speed.to_string()}}));
+                _ => unreachable!(),
+            };
+            let value = if self.step == CalibrationStep::Temperature {
+                format!("{{if layer_num <= 1}}{}{{else}}{{{expression}}}{{endif}}", self.highest)
+            } else {
+                format!("{{{expression}}}")
+            };
+            let marker = format!(";LAYERCOVE_CALIBRATION {:?} {value} Z={{layer_z}}", self.step);
+            let command = match self.step {
+                CalibrationStep::Temperature => format!("M104 S{value}"),
+                CalibrationStep::PressureAdvance => match flavor.as_str() {
+                    "klipper" => format!("SET_PRESSURE_ADVANCE ADVANCE={{{expression}}}"),
+                    "reprapfirmware" => format!("M572 D0 S{{{expression}}}"),
+                    "bambu" => format!("M900 K{{{expression}}} L1000 M10"),
+                    _ => format!("M900 K{{{expression}}}"),
+                },
+                _ => String::new(),
+            };
+            writeln!(&mut layer_code, "{marker}\n{command}").unwrap();
+            if self.step == CalibrationStep::VolumetricFlow {
+                let area = layer_height
+                    * (nozzle * 1.75 - layer_height * (1.0 - std::f64::consts::PI / 4.0))
+                    * profile_number(&filament, "filament_flow_ratio")?;
+                let speed = (self.lowest + height * self.increment) / area;
+                if speed
+                    > profile_number(&printer, "machine_max_speed_x")?
+                        .min(profile_number(&printer, "machine_max_speed_y")?)
+                {
+                    return Err(AppError::Bad(
+                        "volumetric test exceeds printer XY speed limit".into(),
+                    ));
                 }
+                writeln!(
+                    &mut layer_code,
+                    ";LAYERCOVE_CALIBRATION_SPEED {{if layer_num == 0}}{{initial_layer_speed}}{{else}}{{if slow_down_layers > 1 && layer_num < slow_down_layers}}{{min(round(({expression}) / {area}), initial_layer_speed + (round(({expression}) / {area}) - initial_layer_speed) * layer_num / slow_down_layers)}}{{else}}{{round(({expression}) / {area})}}{{endif}}{{endif}}"
+                )
+                .unwrap();
             }
-            objects.push(json!({"path":path,"count":1,"filaments":[1],"height_ranges":ranges}));
+            objects.push(json!({"path":path,"count":1,"filaments":[1]}));
         }
         let layer_code =
             format!("{}\n{layer_code}", printer["layer_change_gcode"].as_str().unwrap_or_default());
@@ -346,7 +561,7 @@ impl Calibration {
             tokio::fs::write(path, serde_json::to_vec(&profile)?).await?;
         }
         let assembly = dir.join("calibration-assembly.json");
-        tokio::fs::write(&assembly, serde_json::to_vec(&json!({"plates":[{"plate_name":"Calibration","need_arrange":true,"objects":objects}]}))?).await?;
+        tokio::fs::write(&assembly, serde_json::to_vec(&json!({"plates":[{"plate_name":"Calibration","need_arrange":self.step != CalibrationStep::FlowRate,"objects":objects}]}))?).await?;
         tokio::fs::write(dir.join("calibration.json"), serde_json::to_vec(self)?).await?;
         Ok(assembly)
     }
@@ -438,7 +653,7 @@ pub fn rewrite_retraction(input: &str, request: &Calibration) -> Result<String, 
                         .enumerate()
                         .rfind(|(i, _)| z >= 0.4 + *i as f64)
                         .map_or(0, |(i, _)| i);
-                    let value = values[band];
+                    let value = request.lowest + (z - 0.4).max(0.0).floor() * request.increment;
                     pending = Some((-amount, value, output.len(), line.to_owned(), band));
                     Some(format!("{} E-{}{}", &captures[1], decimal(value), &captures[3]))
                 } else if let Some((retracted, value, _, _, band)) = pending.take() {
@@ -490,6 +705,49 @@ pub fn rewrite_retraction(input: &str, request: &Calibration) -> Result<String, 
     Ok(output)
 }
 
+fn rewrite_volumetric(input: &str) -> Result<String, AppError> {
+    let mut output = String::with_capacity(input.len());
+    let mut speed = None;
+    let mut wall = false;
+    let mut changed = false;
+    for line in input.lines() {
+        if line == ";LAYERCOVE_CALIBRATION_END" {
+            speed = None;
+        }
+        if let Some(value) = line.strip_prefix(";LAYERCOVE_CALIBRATION_SPEED ") {
+            let value: f64 = value.parse().map_err(|_| AppError::Internal)?;
+            if !value.is_finite() || value <= 0.0 {
+                return Err(AppError::Execution("invalid volumetric speed marker".into()));
+            }
+            speed = Some(value * 60.0);
+        }
+        if line.starts_with("; FEATURE:") || line.starts_with(";TYPE:") {
+            wall = line.contains("Outer wall");
+        }
+        let (code, comment) = line.split_once(';').unwrap_or((line, ""));
+        if wall
+            && let Some(speed) = speed
+            && code.starts_with("G1 ")
+            && code.split_whitespace().any(|s| {
+                s.strip_prefix('E').and_then(|v| v.parse::<f64>().ok()).is_some_and(|v| v > 0.0)
+            })
+            && code.split_whitespace().any(|s| s.starts_with('X') || s.starts_with('Y'))
+        {
+            let parts: Vec<_> = code.split_whitespace().filter(|s| !s.starts_with('F')).collect();
+            writeln!(&mut output, "{} F{speed:.3} ;{comment}", parts.join(" ")).unwrap();
+            changed = true;
+        } else {
+            writeln!(&mut output, "{line}").unwrap();
+        }
+    }
+    if !changed {
+        return Err(AppError::Execution(
+            "volumetric artifact has no recognized outer walls".into(),
+        ));
+    }
+    Ok(output)
+}
+
 fn decimal(value: f64) -> String {
     // Orca's extrusion writer uses five decimal places.
     format!("{value:.5}").trim_end_matches('0').trim_end_matches('.').to_owned()
@@ -501,13 +759,20 @@ pub async fn finish_artifact(
     dir: &Path,
     request: &Calibration,
 ) -> Result<Vec<u8>, AppError> {
-    if request.step != CalibrationStep::Retraction {
+    if !matches!(request.step, CalibrationStep::Retraction | CalibrationStep::VolumetricFlow) {
         return Ok(bytes);
     }
+    let rewrite = |text: &str| {
+        if request.step == CalibrationStep::Retraction {
+            rewrite_retraction(text, request)
+        } else {
+            rewrite_volumetric(text)
+        }
+    };
     if !export {
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| AppError::Execution("calibration G-code is not UTF-8".into()))?;
-        return Ok(rewrite_retraction(text, request)?.into_bytes());
+        return Ok(rewrite(text)?.into_bytes());
     }
     use std::io::{Cursor, Read, Write as IoWrite};
     let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))
@@ -530,7 +795,7 @@ pub async fn finish_artifact(
         }
         entry.read_to_string(&mut gcode)?;
     }
-    let rewritten = rewrite_retraction(&gcode, request)?;
+    let rewritten = rewrite(&gcode)?;
     let digest_path = dir.join("retraction.gcode");
     tokio::fs::write(&digest_path, &rewritten).await?;
     // Coreutils is present in the pinned runtime. Orca/Bambu requires an MD5 sidecar for plate G-code.
@@ -576,14 +841,60 @@ pub async fn finish_artifact(
 }
 
 fn set(profile: &mut Value, key: &str, value: impl Into<Value>) {
-    profile[key] = value.into();
+    // Orca's JSON profile loader accepts scalar settings as strings.
+    profile[key] = match value.into() {
+        Value::Bool(value) => if value { "1" } else { "0" }.into(),
+        Value::Number(value) => value.to_string().into(),
+        value => value,
+    };
+}
+fn bed_bounds(profile: &Value) -> Result<([f64; 2], [f64; 2]), AppError> {
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    let points = profile["printable_area"]
+        .as_array()
+        .ok_or_else(|| AppError::Bad("printable_area is required".into()))?;
+    for point in points {
+        let (x, y) = point
+            .as_str()
+            .and_then(|s| s.split_once('x'))
+            .ok_or_else(|| AppError::Bad("invalid printable_area".into()))?;
+        let values = [x.parse::<f64>(), y.parse::<f64>()];
+        for (i, value) in values.into_iter().enumerate() {
+            let value = value
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| AppError::Bad("invalid printable_area".into()))?;
+            low[i] = low[i].min(value);
+            high[i] = high[i].max(value);
+        }
+    }
+    if (0..2).any(|i| !low[i].is_finite() || !high[i].is_finite() || high[i] <= low[i]) {
+        return Err(AppError::Bad("empty printable_area".into()));
+    }
+    Ok((low, high))
+}
+fn volumetric_bed_span(printer: &Value) -> Result<f64, AppError> {
+    let (low, high) = bed_bounds(printer)?;
+    let span = high[0] - low[0];
+    if !span.is_finite() || span <= 10.0 {
+        return Err(AppError::Bad("volumetric bed must fit the 10 mm brim allowance".into()));
+    }
+    Ok(span)
 }
 pub fn profile_number(profile: &Value, key: &str) -> Result<f64, AppError> {
+    let number = profile_nonnegative_number(profile, key)?;
+    if number == 0.0 {
+        return Err(AppError::Bad(format!("positive profile setting required: {key}")));
+    }
+    Ok(number)
+}
+fn profile_nonnegative_number(profile: &Value, key: &str) -> Result<f64, AppError> {
     let value = profile[key].as_array().and_then(|a| a.first()).unwrap_or(&profile[key]);
     let number = value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok()));
     number
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| AppError::Bad(format!("positive profile setting required: {key}")))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| AppError::Bad(format!("nonnegative profile setting required: {key}")))
 }
 fn set_result(profile: &mut Value, step: CalibrationStep, value: f64) {
     let key = match step {
@@ -602,65 +913,37 @@ fn set_result(profile: &mut Value, step: CalibrationStep, value: f64) {
     }
 }
 
-fn cuboid(out: &mut String, origin: [f64; 3], size: [f64; 3]) {
-    let [x, y, z] = origin;
-    let [w, d, h] = size;
-    let v = [
-        [x, y, z],
-        [x + w, y, z],
-        [x + w, y + d, z],
-        [x, y + d, z],
-        [x, y, z + h],
-        [x + w, y, z + h],
-        [x + w, y + d, z + h],
-        [x, y + d, z + h],
-    ];
-    for face in [
-        [0, 2, 1],
-        [0, 3, 2],
-        [4, 5, 6],
-        [4, 6, 7],
-        [0, 1, 5],
-        [0, 5, 4],
-        [1, 2, 6],
-        [1, 6, 5],
-        [2, 3, 7],
-        [2, 7, 6],
-        [3, 0, 4],
-        [3, 4, 7],
-    ] {
-        out.push_str("facet normal 0 0 0\nouter loop\n");
-        for index in face {
-            let [a, b, c] = v[index];
-            writeln!(out, "vertex {a} {b} {c}").unwrap();
+#[cfg(test)]
+mod volumetric_tests {
+    use super::*;
+    #[test]
+    fn malformed_and_unusable_beds_are_bad_requests() {
+        for area in [
+            json!([]),
+            json!(["bad"]),
+            json!(["NaNx0", "250x250"]),
+            json!(["0x0", "0x250"]),
+            json!(["0x0", "5x250"]),
+            json!(["0x0", "10x250"]),
+        ] {
+            assert!(matches!(
+                volumetric_bed_span(&json!({"printable_area":area})),
+                Err(AppError::Bad(_))
+            ));
         }
-        out.push_str("endloop\nendfacet\n");
+        assert_eq!(
+            volumetric_bed_span(&json!({"printable_area":["-10x-10","240x240"]})).unwrap(),
+            250.0
+        );
     }
-}
-fn digits(out: &mut String, text: &str, z: f64) {
-    const FONT: [[u8; 5]; 10] = [
-        [7, 5, 5, 5, 7],
-        [2, 6, 2, 2, 7],
-        [7, 1, 7, 4, 7],
-        [7, 1, 7, 1, 7],
-        [5, 5, 7, 1, 1],
-        [7, 4, 7, 1, 7],
-        [7, 4, 7, 5, 7],
-        [7, 1, 1, 1, 1],
-        [7, 5, 7, 5, 7],
-        [7, 5, 7, 1, 7],
-    ];
-    for (i, digit) in text.bytes().enumerate() {
-        for (row, bits) in FONT[usize::from(digit - b'0')].iter().enumerate() {
-            for col in 0..3 {
-                if bits & (1 << (2 - col)) != 0 {
-                    cuboid(
-                        out,
-                        [1.0 + i as f64 * 4.0 + f64::from(col), 5.0 - row as f64, z],
-                        [1.0, 1.0, 0.4],
-                    );
-                }
-            }
-        }
+    #[test]
+    fn only_positive_extrusion_wall_moves_receive_the_layer_speed() {
+        let input = ";LAYERCOVE_CALIBRATION_SPEED 20\n;TYPE:Outer wall\nG1 X1 Y2 E-.01 F900\nG1 X2 E0 F900\nG1 X3 E.1 F900\n;LAYERCOVE_CALIBRATION_SPEED 30\nG1 X4 E.1\n;LAYERCOVE_CALIBRATION_END\nG1 X5 E.1 F900\n";
+        let result = rewrite_volumetric(input).unwrap();
+        assert!(result.contains("G1 X1 Y2 E-.01 F900\n"));
+        assert!(result.contains("G1 X2 E0 F900\n"));
+        assert!(result.contains("G1 X3 E.1 F1200.000"));
+        assert!(result.contains("G1 X4 E.1 F1800.000"));
+        assert!(result.ends_with("G1 X5 E.1 F900\n"));
     }
 }
