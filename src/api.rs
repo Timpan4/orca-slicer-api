@@ -51,7 +51,8 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
         "supported_scopes": contract.supported_scopes,
         "calibration": {
             "available": true,
-            "version": "1",
+            // Version 2 no longer limits temperatures to the filament's recommended range.
+            "version": "2",
             "steps": ["temperature", "flow_rate", "pressure_advance", "retraction", "volumetric_flow"],
         },
     }))

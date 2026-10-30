@@ -117,10 +117,10 @@ impl Calibration {
                 .get(&CalibrationStep::Temperature)
                 .ok_or_else(|| AppError::Bad("temperature result is required".into()))?
         };
-        if temperature > profile_number(&filament, "nozzle_temperature_range_high")? {
-            return Err(AppError::Bad(
-                "temperature exceeds this filament profile's maximum".into(),
-            ));
+        // The filament's temperature range is a recommendation, as in OrcaSlicer, whose
+        // temperature dialog (calib_dlg.cpp at the pinned source commit) only limits the start to 500 °C.
+        if temperature > 500.0 {
+            return Err(AppError::Bad("calibration temperature cannot exceed 500 °C".into()));
         }
         for (step, value) in self
             .previous_results

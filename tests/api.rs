@@ -87,6 +87,8 @@ async fn discovery_contract_matches_layercove_shape() {
     assert_eq!(capabilities["contract_version"], "1");
     assert_eq!(capabilities["engine"]["name"], "OrcaSlicer");
     assert_eq!(capabilities["capabilities"]["cancel"], false);
+    // LayerCove requires calibration protocol 2, which drops the filament range limit.
+    assert_eq!(capabilities["calibration"]["version"], "2");
     assert!(capabilities.get("process_schema").is_none());
 
     let (status, schema) = json_response(app, "/schema/process").await;
