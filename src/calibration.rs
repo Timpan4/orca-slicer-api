@@ -157,10 +157,33 @@ impl Calibration {
         process_path: &Path,
         filament_path: &Path,
     ) -> Result<PathBuf, AppError> {
+        self.prepare_with_cli(
+            dir,
+            printer_path,
+            process_path,
+            filament_path,
+            &crate::config::cli_path(),
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_with_cli(
+        &self,
+        dir: &Path,
+        printer_path: &Path,
+        process_path: &Path,
+        filament_path: &Path,
+        cli: &str,
+    ) -> Result<PathBuf, AppError> {
         self.values()?;
         let mut printer: Value = serde_json::from_slice(&tokio::fs::read(printer_path).await?)?;
         let mut process: Value = serde_json::from_slice(&tokio::fs::read(process_path).await?)?;
         let mut filament: Value = serde_json::from_slice(&tokio::fs::read(filament_path).await?)?;
+        let volumetric_span = if self.step == CalibrationStep::VolumetricFlow {
+            Some(volumetric_bed_span(&printer)?)
+        } else {
+            None
+        };
         let temperature = if self.step == CalibrationStep::Temperature {
             self.highest.max(self.baseline)
         } else {
@@ -374,13 +397,14 @@ impl Calibration {
                 CalibrationStep::VolumetricFlow => "volumetric_speed/SpeedTestStructure.drc",
                 CalibrationStep::FlowRate => unreachable!(),
             };
-            let mut mesh = crate::calibration_mesh::Mesh::tower(dir, resource).await?;
+            let mut mesh = crate::calibration_mesh::Mesh::tower(dir, resource, cli).await?;
             mesh.on_bed();
             if self.step == CalibrationStep::Temperature {
                 let bottom = (350.0 - self.highest) / 5.0 * 10.0;
-                mesh.cut(bottom + height, true)?;
+                // Plater::calib_temp uses libslic3r's EPSILON (1e-4 mm).
+                mesh.cut(bottom + height + 1e-4, true)?;
                 if bottom > 0.0 {
-                    mesh.cut(bottom, false)?;
+                    mesh.cut(bottom + 1e-4, false)?;
                 }
                 mesh.on_bed();
                 set_result(&mut filament, CalibrationStep::Temperature, self.highest);
@@ -442,19 +466,8 @@ impl Calibration {
                         set(&mut process, "reduce_crossing_wall", false);
                     }
                     CalibrationStep::VolumetricFlow => {
-                        let points =
-                            printer["printable_area"].as_array().ok_or(AppError::Internal)?;
-                        let xs: Vec<f64> = points
-                            .iter()
-                            .map(|p| {
-                                p.as_str()
-                                    .and_then(|s| s.split('x').next())
-                                    .and_then(|s| s.parse().ok())
-                                    .ok_or(AppError::Internal)
-                            })
-                            .collect::<Result<_, _>>()?;
-                        let span = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-                            - xs.iter().copied().fold(f64::INFINITY, f64::min);
+                        set(&mut printer, "use_relative_e_distances", true);
+                        let span = volumetric_span.ok_or(AppError::Internal)?;
                         let (lo, hi) = mesh.bounds();
                         mesh.scale([((span - 10.0) / (hi[0] - lo[0])).min(1.0), 1.0, 1.0]);
                         let max_height = profile_nonnegative_number(&printer, "max_layer_height")?
@@ -528,7 +541,7 @@ impl Calibration {
                 }
                 writeln!(
                     &mut layer_code,
-                    ";LAYERCOVE_CALIBRATION_SPEED {{round(({expression}) / {area})}}"
+                    ";LAYERCOVE_CALIBRATION_SPEED {{if layer_num == 0}}{{initial_layer_speed}}{{else}}{{if slow_down_layers > 1 && layer_num < slow_down_layers}}{{min(round(({expression}) / {area}), initial_layer_speed + (round(({expression}) / {area}) - initial_layer_speed) * layer_num / slow_down_layers)}}{{else}}{{round(({expression}) / {area})}}{{endif}}{{endif}}"
                 )
                 .unwrap();
             }
@@ -715,7 +728,9 @@ fn rewrite_volumetric(input: &str) -> Result<String, AppError> {
         if wall
             && let Some(speed) = speed
             && code.starts_with("G1 ")
-            && code.split_whitespace().any(|s| s.starts_with('E'))
+            && code.split_whitespace().any(|s| {
+                s.strip_prefix('E').and_then(|v| v.parse::<f64>().ok()).is_some_and(|v| v > 0.0)
+            })
             && code.split_whitespace().any(|s| s.starts_with('X') || s.starts_with('Y'))
         {
             let parts: Vec<_> = code.split_whitespace().filter(|s| !s.starts_with('F')).collect();
@@ -854,10 +869,18 @@ fn bed_bounds(profile: &Value) -> Result<([f64; 2], [f64; 2]), AppError> {
             high[i] = high[i].max(value);
         }
     }
-    if (0..2).any(|i| high[i] <= low[i]) {
+    if (0..2).any(|i| !low[i].is_finite() || !high[i].is_finite() || high[i] <= low[i]) {
         return Err(AppError::Bad("empty printable_area".into()));
     }
     Ok((low, high))
+}
+fn volumetric_bed_span(printer: &Value) -> Result<f64, AppError> {
+    let (low, high) = bed_bounds(printer)?;
+    let span = high[0] - low[0];
+    if !span.is_finite() || span <= 10.0 {
+        return Err(AppError::Bad("volumetric bed must fit the 10 mm brim allowance".into()));
+    }
+    Ok(span)
 }
 pub fn profile_number(profile: &Value, key: &str) -> Result<f64, AppError> {
     let number = profile_nonnegative_number(profile, key)?;
@@ -887,5 +910,40 @@ fn set_result(profile: &mut Value, step: CalibrationStep, value: f64) {
     }
     if step == CalibrationStep::PressureAdvance {
         set(profile, "enable_pressure_advance", json!(["1"]));
+    }
+}
+
+#[cfg(test)]
+mod volumetric_tests {
+    use super::*;
+    #[test]
+    fn malformed_and_unusable_beds_are_bad_requests() {
+        for area in [
+            json!([]),
+            json!(["bad"]),
+            json!(["NaNx0", "250x250"]),
+            json!(["0x0", "0x250"]),
+            json!(["0x0", "5x250"]),
+            json!(["0x0", "10x250"]),
+        ] {
+            assert!(matches!(
+                volumetric_bed_span(&json!({"printable_area":area})),
+                Err(AppError::Bad(_))
+            ));
+        }
+        assert_eq!(
+            volumetric_bed_span(&json!({"printable_area":["-10x-10","240x240"]})).unwrap(),
+            250.0
+        );
+    }
+    #[test]
+    fn only_positive_extrusion_wall_moves_receive_the_layer_speed() {
+        let input = ";LAYERCOVE_CALIBRATION_SPEED 20\n;TYPE:Outer wall\nG1 X1 Y2 E-.01 F900\nG1 X2 E0 F900\nG1 X3 E.1 F900\n;LAYERCOVE_CALIBRATION_SPEED 30\nG1 X4 E.1\n;LAYERCOVE_CALIBRATION_END\nG1 X5 E.1 F900\n";
+        let result = rewrite_volumetric(input).unwrap();
+        assert!(result.contains("G1 X1 Y2 E-.01 F900\n"));
+        assert!(result.contains("G1 X2 E0 F900\n"));
+        assert!(result.contains("G1 X3 E.1 F1200.000"));
+        assert!(result.contains("G1 X4 E.1 F1800.000"));
+        assert!(result.ends_with("G1 X5 E.1 F900\n"));
     }
 }

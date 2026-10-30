@@ -43,12 +43,12 @@ pub struct AppState {
 const MAX_MODEL: usize = 512 * 1024 * 1024;
 const MAX_PROFILE: usize = 32 * 1024 * 1024;
 const BED_TYPE_PROFILE_KEY: &str = "curr_bed_type";
-const SLICE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const SLICE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-struct ProcessGroup(Option<rustix::process::Pid>);
+pub(crate) struct ProcessGroup(Option<rustix::process::Pid>);
 
 impl ProcessGroup {
-    fn terminate(&mut self) {
+    pub(crate) fn terminate(&mut self) {
         if let Some(pid) = self.0.take() {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
@@ -61,7 +61,7 @@ impl Drop for ProcessGroup {
     }
 }
 
-fn spawn_process(command: &mut Command) -> Result<(Child, ProcessGroup), AppError> {
+pub(crate) fn spawn_process(command: &mut Command) -> Result<(Child, ProcessGroup), AppError> {
     command.as_std_mut().process_group(0);
     command.kill_on_drop(true);
     let child = command.spawn().map_err(|error| AppError::Execution(error.to_string()))?;
@@ -240,7 +240,13 @@ async fn slice_job(
             return Err(AppError::Bad("calibration requires printerProfile, presetProfile, one filamentProfile, and schemaHash".into()));
         }
         let input = request
-            .prepare(dir, printer.as_deref().unwrap(), preset.as_deref().unwrap(), &filaments[0])
+            .prepare_with_cli(
+                dir,
+                printer.as_deref().unwrap(),
+                preset.as_deref().unwrap(),
+                &filaments[0],
+                &s.config.cli_path,
+            )
             .await?;
         model = Some(input);
         arrange = true;

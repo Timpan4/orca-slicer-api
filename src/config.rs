@@ -1,5 +1,9 @@
 use std::{env, path::PathBuf};
 
+pub(crate) fn cli_path() -> String {
+    env::var("ORCA_CLI_PATH").unwrap_or_else(|_| "orca-slicer".into())
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -36,7 +40,7 @@ impl Config {
             data_dir: env::var_os("ORCA_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/app/data")),
-            cli_path: env::var("ORCA_CLI_PATH").unwrap_or_else(|_| "orca-slicer".into()),
+            cli_path: cli_path(),
             bridge_path: env::var("ORCA_BRIDGE_PATH").ok(),
             image_digest,
             schema_path,

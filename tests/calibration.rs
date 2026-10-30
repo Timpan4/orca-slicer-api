@@ -1,6 +1,35 @@
 use orca_slicer_api::calibration::{Calibration, CalibrationStep, rewrite_retraction};
 
 #[tokio::test]
+async fn unusable_volumetric_beds_fail_as_bad_requests_before_export() {
+    use orca_slicer_api::error::AppError;
+    let dir = std::env::temp_dir().join(format!("volumetric-bed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let printer = dir.join("printer.json");
+    let process = dir.join("process.json");
+    let filament = dir.join("filament.json");
+    std::fs::write(&process, serde_json::json!({"layer_height":"0.2"}).to_string()).unwrap();
+    std::fs::write(&filament, "{}").unwrap();
+    let request:Calibration=serde_json::from_value(serde_json::json!({"step":"volumetric_flow","lowest":5,"highest":9,"increment":2,"baseline":7,"previous_results":{"temperature":210}})).unwrap();
+    for area in [
+        serde_json::json!([]),
+        serde_json::json!(["bad"]),
+        serde_json::json!(["0x0", "5x250"]),
+        serde_json::json!(["0x0", "10x250"]),
+    ] {
+        std::fs::write(&printer,serde_json::json!({"printable_area":area,"nozzle_diameter":["0.4"],"gcode_flavor":"klipper","printable_height":"250"}).to_string()).unwrap();
+        assert!(
+            matches!(
+                request.prepare(&dir, &printer, &process, &filament).await,
+                Err(AppError::Bad(_))
+            ),
+            "{area}"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires Orca calibration resources"]
 async fn flow_patterns_keep_native_objects_and_modifiers() {
     for (pattern, count) in [("yolo", 11), ("yolo_perfectionist", 16), ("pass1", 9), ("pass2", 10)]

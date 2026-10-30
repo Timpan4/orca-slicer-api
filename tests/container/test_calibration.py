@@ -108,6 +108,11 @@ for step, low, high, increment, baseline in steps:
               "calibration": json.dumps(calibration)}
     fields.update({key: json.dumps(dict(type=kind, name=name, inherits=name, **{"from": "system"}))
                    for key, (kind, name) in profiles.items()})
+    if step == "volumetric_flow" and mode == "klipper":
+        # Exercise the ramp with a first-layer speed below the calibration speeds.
+        fields["presetProfile"] = json.dumps(dict(
+            type="process", name="Calibration slowdown", setting_id="calibration-slowdown", inherits=profiles["presetProfile"][1],
+            slow_down_layers="3", initial_layer_speed="10", **{"from": "user"}))
     if mode == "bambu":
         fields["exportType"] = "3mf"
     boundary = "layercove-calibration-test"
@@ -178,9 +183,35 @@ for step, low, high, increment, baseline in steps:
         for value,z in values:
             assert math.isclose(value,5+z*2,abs_tol=1e-5),(value,z)
         area = .32 * (.7 - .32 * (1 - math.pi / 4))
-        feedrates = {float(v) for v in re.findall(r"\bF([\d.]+)",text)}
-        for value,z in values:
-            assert 60*math.floor(value/area+.5) in feedrates,(value,z)
+        initial = float(re.search(r"^; initial_layer_speed = ([\d.]+)$", text, re.M)[1])
+        slowdown = int(re.search(r"^; slow_down_layers = (\d+)$", text, re.M)[1])
+        layer = -1
+        wall = False
+        expected = None
+        checked = set()
+        feedrate = None
+        for line in text.splitlines():
+            marker = re.match(r";LAYERCOVE_CALIBRATION VolumetricFlow ([\d.]+)", line)
+            if marker:
+                layer += 1
+                target = math.floor(float(marker[1]) / area + .5)
+                expected = initial if layer == 0 else target
+                if 0 < layer < slowdown:
+                    expected = min(target, initial + (target - initial) * layer / slowdown)
+            if line == ";LAYERCOVE_CALIBRATION_END":
+                expected = None
+            if line.startswith((";TYPE:", "; FEATURE:")):
+                wall = "Outer wall" in line
+            code = line.split(";", 1)[0]
+            fields = {k: float(v) for k, v in re.findall(r"\b([XYEF])(-?(?:\d+(?:\.\d*)?|\.\d+))", code)}
+            feedrate = fields.get("F", feedrate)
+            if expected is not None and wall and code.startswith("G1 ") and fields.get("E", 0) > 0 and ("X" in fields or "Y" in fields):
+                # F has three decimals. Pinned PlaceholderParser.cpp uses the
+                # stream default of six significant digits for speed expressions.
+                uncertainty = .5 * 10**-3 + 60 * .5 * 10**(math.floor(math.log10(expected)) - 5)
+                assert math.isclose(feedrate, 60 * expected, abs_tol=uncertainty), (layer, feedrate, expected)
+                checked.add(layer)
+        assert checked == set(range(len(values))), checked
     expected_names = {"temperature":"temperature_tower","pressure_advance":"tower_with_seam","retraction":"retraction_tower","volumetric_flow":"SpeedTestStructure"}
     if step in expected_names:
         assert expected_names[step] in text, expected_names[step]

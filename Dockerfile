@@ -45,6 +45,11 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY src ./src
 COPY tests ./tests
 COPY --from=orca-source /opt/orca-slicer /tmp/orca-slicer
+RUN cargo test --locked --release --lib --no-run \
+    && mkdir /tmp/resource-tests \
+    && cp target/release/deps/orca_slicer_api-* /tmp/resource-tests/ \
+    && cargo test --locked --release --test calibration --no-run \
+    && cp target/release/deps/calibration-* /tmp/resource-tests/
 RUN ORCA_SOURCE_DIR=/tmp/orca-slicer \
     cargo test --locked --release --test pinned_source -- --ignored
 RUN cargo build --release --locked \
@@ -100,3 +105,13 @@ USER 10001:10001
 WORKDIR /app
 EXPOSE 3000
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/bin/orca-slicer-api"]
+
+FROM runtime AS calibration-tests
+COPY --from=rust-builder /tmp/resource-tests /tmp/tests
+# Run resource regressions with the final image's CLI, libraries and configuration.
+RUN for test in /tmp/tests/calibration-* /tmp/tests/orca_slicer_api-*; do \
+      if [ -x "$test" ] && [ -f "$test" ]; then "$test" --ignored || exit; fi; \
+    done && touch /tmp/calibration-tests-passed
+
+FROM runtime AS final
+COPY --from=calibration-tests /tmp/calibration-tests-passed /app/calibration-tests-passed
