@@ -179,9 +179,10 @@ impl Calibration {
                     *value = decimal(nozzle * ratio / 100.0).into();
                 }
             };
-            match &mut process[key] {
-                Value::Array(values) => values.iter_mut().for_each(resolve),
-                value => resolve(value),
+            match process.get_mut(key) {
+                Some(Value::Array(values)) => values.iter_mut().for_each(resolve),
+                Some(value) => resolve(value),
+                None => {}
             }
         }
         set(&mut process, "layer_height", layer_height);

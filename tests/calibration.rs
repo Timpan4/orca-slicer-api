@@ -124,5 +124,11 @@ async fn percentage_line_widths_become_millimetres_of_the_nozzle() {
     assert_eq!(prepared["initial_layer_line_width"], "0.64");
     assert_eq!(prepared["line_width"], serde_json::json!(["0.44"]));
     assert_eq!(prepared["inner_wall_line_width"], "0.45");
+    // A profile that leaves a width to its parent keeps leaving it.
+    let process = write("process.json", serde_json::json!({}));
+    tower.prepare(&dir, &printer, &process, &filament).await.unwrap();
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&process).unwrap()).unwrap();
+    assert!(prepared.get("line_width").is_none(), "{prepared}");
     std::fs::remove_dir_all(dir).unwrap();
 }
