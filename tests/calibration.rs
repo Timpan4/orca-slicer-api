@@ -83,6 +83,7 @@ async fn temperature_tower_may_exceed_the_filament_recommended_range() {
         previous_results: Default::default(),
     };
     tower(240.0, 270.0, 265.0).prepare(&dir, &printer, &process, &filament).await.unwrap();
+    tower(480.0, 500.0, 490.0).prepare(&dir, &printer, &process, &filament).await.unwrap();
     let error =
         tower(490.0, 505.0, 495.0).prepare(&dir, &printer, &process, &filament).await.unwrap_err();
     assert!(error.to_string().contains("500"), "{error}");

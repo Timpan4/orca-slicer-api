@@ -28,7 +28,7 @@ Capability flags are evidence gates. No synthetic schema, model, progress, metad
 
 The Rust shim generates geometry and profile settings, then slices them with the existing checksum-pinned Orca AppImage. It never builds Orca from source. The release gate inspects all five real Bambu 3MF and Klipper G-code artifacts without sending a printer command.
 
-`GET /capabilities` reports `calibration.available`, version `1`, and supported steps. Calibration uses the normal `ORCA_CLI_PATH` and trusted bundled profiles. No separate calibration binary or resources directory is required.
+`GET /capabilities` reports `calibration.available`, version `2`, and supported steps. Version 2 no longer limits temperatures to the filament profile's recommended range. Calibration uses the normal `ORCA_CLI_PATH` and trusted bundled profiles. No separate calibration binary or resources directory is required.
 
 Calibration `POST /slice` replaces `file` with a JSON `calibration` field containing `step`, `lowest`, `highest`, `increment`, `baseline`, and `previous_results`. It requires printer/process/one filament profile and the matching `schemaHash`. Steps are `temperature`, `flow_rate`, `pressure_advance`, `retraction`, and `volumetric_flow`. `previous_results` contains preceding confirmed values. Model uploads, `modelState`, `processOverrides`, and other plates cannot be combined with calibration. The step size must reach the highest test value. Temperature requires whole degrees and cannot exceed 500 °C, the limit of the pinned OrcaSlicer temperature calibration dialog. The filament profile's temperature range is a recommendation and does not limit the test.
 
