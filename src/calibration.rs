@@ -161,10 +161,19 @@ impl Calibration {
         // pinned commit) using the raw number, so "160%" would read as 160 mm and fill the bed.
         // Orca defines both as a ratio over the nozzle diameter, so millimetres print the same.
         for key in ["initial_layer_line_width", "line_width"] {
+            // Like ConfigOptionFloatOrPercent::deserialize, a "%" anywhere marks a ratio, and the
+            // number is read from the start after any whitespace, so "160 %" is also 160%.
             let resolve = |value: &mut Value| {
                 if let Some(ratio) = value
                     .as_str()
-                    .and_then(|text| text.strip_suffix('%'))
+                    .filter(|text| text.contains('%'))
+                    .map(|text| {
+                        let text = text.trim_start();
+                        let end = text
+                            .find(|c: char| !(c.is_ascii_digit() || "+-.eE".contains(c)))
+                            .unwrap_or(text.len());
+                        &text[..end]
+                    })
                     .and_then(|ratio| ratio.parse::<f64>().ok())
                 {
                     *value = decimal(nozzle * ratio / 100.0).into();

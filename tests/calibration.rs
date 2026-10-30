@@ -107,7 +107,7 @@ async fn percentage_line_widths_become_millimetres_of_the_nozzle() {
     );
     let process = write(
         "process.json",
-        serde_json::json!({"initial_layer_line_width":"160%","line_width":["110%"],"inner_wall_line_width":"0.45"}),
+        serde_json::json!({"initial_layer_line_width":" 160 %","line_width":["110%"],"inner_wall_line_width":"0.45"}),
     );
     let filament = write("filament.json", serde_json::json!({}));
     let tower = Calibration {
