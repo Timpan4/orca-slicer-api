@@ -29,7 +29,10 @@ if mode == "klipper":
     }
 steps = [
     ("temperature", 200, 210, 5, 210),
-    ("flow_rate", .9, 1.1, .1, 1),
+    ("flow_rate", "yolo", None, None, 1),
+    ("flow_rate", "yolo_perfectionist", None, None, 1),
+    ("flow_rate", "pass1", None, None, 1),
+    ("flow_rate", "pass2", None, None, 1),
     ("pressure_advance", .01, .05, .02, .02),
     ("retraction", .2, .6, .2, .4),
     ("volumetric_flow", 5, 9, 2, 7),
@@ -37,8 +40,8 @@ steps = [
 previous = {}
 
 
-def check_flow_tiles(text):
-    # Compare the longest first-layer outside wall, the same cuboid edge in each tile.
+def check_flow_tiles(text, names, pattern, baseline):
+    # Compare the longest first-layer outside wall, the same native tile edge in each object.
     # Compare E per millimeter across those edges. Preview WIDTH already includes flow compensation.
     x = y = extrusion = 0.0
     relative = False
@@ -48,10 +51,10 @@ def check_flow_tiles(text):
     height = None
     first_height = {}
     for line in text.splitlines():
-        object_match = re.match(r"; printing object sample_(\d+)_", line)
+        object_match = re.match(r"; printing object flowrate_(m?\d+(?:\.\d+)?)_", line)
         if object_match:
-            tile = int(object_match[1])
-        if line.startswith("; stop printing object"):
+            tile = object_match[1]
+        if line.startswith("; stop printing object flowrate_"):
             tile = None
         if line.startswith((";TYPE:", "; FEATURE:")):
             outside = "Outer wall" in line
@@ -78,20 +81,31 @@ def check_flow_tiles(text):
         x, y = next_x, next_y
         if "E" in fields:
             extrusion = fields["E"] if not relative else extrusion + fields["E"]
-    assert set(longest) == {1, 2, 3}, longest
-    baseline_length, baseline_amount = longest[2]
+    assert set(longest) == names, longest
+    baseline_length, baseline_amount = longest["0"]
     for tile, (length, amount) in longest.items():
         ratio = amount / length / (baseline_amount / baseline_length)
         # Writer precision: E five decimals and XY three decimals, propagated through the ratio.
         uncertainty = abs(ratio) * (.000005 / amount + .000005 / baseline_amount
             + math.sqrt(2) * .001 * (1 / length + 1 / baseline_length))
-        assert abs(ratio - (.9 + (tile - 1) * .1)) <= uncertainty, (tile, ratio, uncertainty)
+        modifier = float(tile.replace("m","-"))
+        expected = (baseline + modifier) / baseline if pattern.startswith("yolo") else 1 + modifier / 100
+        assert abs(ratio - expected) <= uncertainty, (tile, ratio, expected, uncertainty)
 
 
 for step, low, high, increment, baseline in steps:
+    previous.pop(step, None)
+    artifact_name = step + ("_" + low if step == "flow_rate" else "")
+    if len(sys.argv) > 4 and sys.argv[4] != artifact_name:
+        previous[step] = baseline
+        continue
+    calibration = dict(step=step,baseline=baseline,previous_results=previous)
+    if step == "flow_rate":
+        calibration["flow_pattern"] = low
+    else:
+        calibration.update(lowest=low,highest=high,increment=increment)
     fields = {"schemaHash": schema["schema_hash"], "requestId": str(uuid.uuid4()),
-              "calibration": json.dumps(dict(step=step, lowest=low, highest=high,
-                  increment=increment, baseline=baseline, previous_results=previous))}
+              "calibration": json.dumps(calibration)}
     fields.update({key: json.dumps(dict(type=kind, name=name, inherits=name, **{"from": "system"}))
                    for key, (kind, name) in profiles.items()})
     if mode == "bambu":
@@ -108,7 +122,7 @@ for step, low, high, increment, baseline in steps:
     except urllib.error.HTTPError as error:
         raise RuntimeError(error.read().decode()) from error
     artifact = response.read()
-    (OUTPUT / (step + (".3mf" if mode == "bambu" else ".gcode"))).write_bytes(artifact)
+    (OUTPUT / (artifact_name + (".3mf" if mode == "bambu" else ".gcode"))).write_bytes(artifact)
     assert float(response.headers["x-print-time-seconds"]) > 0
     if mode == "bambu":
         with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
@@ -120,13 +134,35 @@ for step, low, high, increment, baseline in steps:
             assert checksum.lower() == hashlib.md5(artifact).hexdigest(), checksum
     assert b"G1 " in artifact and b"fixture-gcode" not in artifact
     text = artifact.decode()
+    settings = dict(re.findall(r"^; (\w+) = (.*)$",text,re.M))
+    expected_settings = {
+        "temperature": {"brim_width":"5"},
+        "pressure_advance": {"wall_loops":"2","bottom_shell_layers":"0","top_shell_layers":"0","brim_width":"6"},
+        "retraction": {"wall_loops":"2","bottom_shell_layers":"3","top_shell_layers":"0","layer_height":"0.2"},
+        "volumetric_flow": {"wall_loops":"1","bottom_shell_layers":"0","top_shell_layers":"0","layer_height":"0.32","spiral_mode":"1","outer_wall_line_width":"0.7","brim_width":"5"},
+    }.get(step,{})
+    for key,value in expected_settings.items():
+        assert settings.get(key)==value,(step,key,settings.get(key),value)
     if step == "temperature":
         emitted = [int(v) for v in re.findall(r"^;LAYERCOVE_CALIBRATION Temperature (\d+)", text, re.M)]
         assert set(emitted) == {200, 205, 210} and emitted[0] == 210 and emitted[-1] == 200
     if step == "flow_rate":
-        check_flow_tiles(text)
+        names = set(re.findall(r"flowrate_(m?\d+(?:\.\d+)?)", text))
+        expected = {
+            "pass1": {"0","5","10","15","20","m5","m10","m15","m20"},
+            "pass2": {"0", *("m" + str(i) for i in range(1,10))},
+            "yolo": {"0", *(f"{sign}0.0{i}" for sign in ("","m") for i in range(1,6))},
+            "yolo_perfectionist": {"0","0.005","0.01","0.015","0.02","0.025","0.03","0.035","m0.005","m0.01","m0.015","m0.02","m0.025","m0.03","m0.035","m0.04"},
+        }[low]
+        assert names == expected, names
+        check_flow_tiles(text, names, low, baseline)
     if step == "pressure_advance":
-        assert {float(v) for v in re.findall(r"^;LAYERCOVE_CALIBRATION PressureAdvance ([\d.]+)", text, re.M)} == {.01, .03, .05}
+        values = [(float(v),float(z)) for v,z in re.findall(r"^;LAYERCOVE_CALIBRATION PressureAdvance ([\d.]+) Z=([\d.]+)", text, re.M)]
+        assert values
+        # The serialized Z may round an internal value just below an integer up to it.
+        assert all(any(math.isclose(v,.01+band*.02) for band in
+                       {math.floor(z),math.floor(math.nextafter(z,-math.inf))})
+                   for v,z in values), values
         prefix = "SET_PRESSURE_ADVANCE ADVANCE=" if mode == "klipper" else "M900 K"
         assert all(f"{prefix}{value}" in text for value in [.01, .03, .05])
     if step == "retraction":
@@ -135,14 +171,26 @@ for step, low, high, increment, baseline in steps:
         assert start and end and start.start() < end.start()
         model = text[start.start():end.start()]
         amounts = {abs(float(v)) for v in re.findall(r"^G1 E(-?[\d.]+)", model, re.M)}
-        assert amounts == {.2, .4, .6}, amounts
+        assert {.2, .4, .6} <= amounts <= {.2, .4, .6, .8}, amounts
     if step == "volumetric_flow":
-        assert {float(v) for v in re.findall(r"^;LAYERCOVE_CALIBRATION VolumetricFlow ([\d.]+)", text, re.M)} == {5, 7, 9}
-        area = .2 * (.7 - .2 * (1 - math.pi / 4))
-        feedrates = {float(v) for v in re.findall(r"\bF([\d.]+)", text)}
-        # Orca emits feedrate with three decimal places. Each requested wall speed must survive slicing.
-        for value in [5, 7, 9]:
-            expected = 60 * value / area
-            assert any(abs(feed - expected) <= .0005 for feed in feedrates), (value, expected)
-    print(json.dumps({"provider": mode, "step": step, "bytes": len(artifact)}), flush=True)
+        values = [(float(v),float(z)) for v,z in re.findall(r"^;LAYERCOVE_CALIBRATION VolumetricFlow ([\d.]+) Z=([\d.]+)",text,re.M)]
+        assert values
+        for value,z in values:
+            assert math.isclose(value,5+z*2,abs_tol=1e-5),(value,z)
+        area = .32 * (.7 - .32 * (1 - math.pi / 4))
+        feedrates = {float(v) for v in re.findall(r"\bF([\d.]+)",text)}
+        for value,z in values:
+            assert 60*math.floor(value/area+.5) in feedrates,(value,z)
+    expected_names = {"temperature":"temperature_tower","pressure_advance":"tower_with_seam","retraction":"retraction_tower","volumetric_flow":"SpeedTestStructure"}
+    if step in expected_names:
+        assert expected_names[step] in text, expected_names[step]
+        heights = [float(z) for z in re.findall(r"^;LAYERCOVE_CALIBRATION \w+ [\d.]+ Z=([\d.]+)",text,re.M)]
+        expected_height = {"temperature":30,"pressure_advance":3,"retraction":3.4,"volumetric_flow":2.5}[step]
+        layer = .32 if step=="volumetric_flow" else .2
+        assert abs(max(heights)-expected_height)<=layer/2+1e-5,(max(heights),expected_height)
+    layers = [float(z) for z in re.findall(r"^;(?: Z_HEIGHT:|Z:)\s*([\d.]+)", text, re.M)]
+    samples = sorted({float(v) for v in re.findall(r"^;LAYERCOVE_CALIBRATION \w+ ([\d.]+)",text,re.M)})
+    print(json.dumps({"provider": mode, "step": step, "flow_pattern": low if step=="flow_rate" else None,
+                      "bytes": len(artifact), "first_z": min(layers), "top_z": max(layers),
+                      "tested_values": samples, "objects": sorted(set(re.findall(r"^; printing object (\S+)",text,re.M)))}), flush=True)
     previous[step] = baseline

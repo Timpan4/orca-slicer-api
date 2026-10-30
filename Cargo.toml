@@ -1,6 +1,6 @@
 [package]
 name = "orca-slicer-api"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "AGPL-3.0-or-later"
@@ -9,7 +9,9 @@ description = "Pinned OrcaSlicer HTTP API and schema service"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["multipart"] }
+earcutr = "0.5.0"
 regex = "1.13.1"
+roxmltree = "0.21.2"
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
