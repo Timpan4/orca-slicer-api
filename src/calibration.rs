@@ -118,9 +118,9 @@ impl Calibration {
                 .ok_or_else(|| AppError::Bad("temperature result is required".into()))?
         };
         // The filament's temperature range is a recommendation, as in OrcaSlicer, whose
-        // temperature tower dialog (v2.3.0 calib_dlg.cpp) only limits the start to 350 °C.
-        if temperature > 350.0 {
-            return Err(AppError::Bad("calibration temperature cannot exceed 350 °C".into()));
+        // temperature dialog (calib_dlg.cpp at the pinned source commit) only limits the start to 500 °C.
+        if temperature > 500.0 {
+            return Err(AppError::Bad("calibration temperature cannot exceed 500 °C".into()));
         }
         for (step, value) in self
             .previous_results

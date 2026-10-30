@@ -84,7 +84,7 @@ async fn temperature_tower_may_exceed_the_filament_recommended_range() {
     };
     tower(240.0, 270.0, 265.0).prepare(&dir, &printer, &process, &filament).await.unwrap();
     let error =
-        tower(340.0, 355.0, 345.0).prepare(&dir, &printer, &process, &filament).await.unwrap_err();
-    assert!(error.to_string().contains("350"), "{error}");
+        tower(490.0, 505.0, 495.0).prepare(&dir, &printer, &process, &filament).await.unwrap_err();
+    assert!(error.to_string().contains("500"), "{error}");
     std::fs::remove_dir_all(dir).unwrap();
 }
