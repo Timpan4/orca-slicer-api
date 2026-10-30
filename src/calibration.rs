@@ -157,6 +157,24 @@ impl Calibration {
             set_result(&mut filament, *step, *result);
         }
         set_result(&mut filament, self.step, self.baseline);
+        // Arrange sizes the skirt from these widths (get_real_skirt_dist in PrintConfig.cpp at the
+        // pinned commit) using the raw number, so "160%" would read as 160 mm and fill the bed.
+        // Orca defines both as a ratio over the nozzle diameter, so millimetres print the same.
+        for key in ["initial_layer_line_width", "line_width"] {
+            let resolve = |value: &mut Value| {
+                if let Some(ratio) = value
+                    .as_str()
+                    .and_then(|text| text.strip_suffix('%'))
+                    .and_then(|ratio| ratio.parse::<f64>().ok())
+                {
+                    *value = decimal(nozzle * ratio / 100.0).into();
+                }
+            };
+            match &mut process[key] {
+                Value::Array(values) => values.iter_mut().for_each(resolve),
+                value => resolve(value),
+            }
+        }
         set(&mut process, "layer_height", layer_height);
         set(&mut process, "initial_layer_print_height", layer_height);
         set(&mut process, "alternate_extra_wall", false);
